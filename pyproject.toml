@@ -1,0 +1,30 @@
+[project]
+name = "leave-me-alone"
+version = "0.1.0"
+description = "Universal multi-agent code engineering toolkit with staged orchestration"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "pydantic>=2.11.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9"]
+
+[project.scripts]
+leave-me-alone = "app.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --confcutdir=tests"

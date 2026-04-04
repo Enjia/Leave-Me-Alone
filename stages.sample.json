@@ -1,0 +1,64 @@
+[
+  {
+    "name": "stage-1-auth-core",
+    "objective": "Implement authentication middleware, token validation, and basic unauthorized-response handling.",
+    "scope_hint": ["src/auth", "src/middleware"],
+    "test_commands": ["pytest tests/auth"],
+    "lint_commands": ["ruff check src tests"],
+    "perf_checks": [],
+    "gate_commands_remote": [],
+    "remote_gate_contracts": [],
+    "execution_env": "local_only",
+    "requires_remote": false,
+    "sync_strategy": "local_only",
+    "required_inputs": [],
+    "produces_artifacts": ["auth_core_ready"],
+    "expected_artifact_paths": ["docs/stage-1-report.json"],
+    "blocking_decisions": [],
+    "rollback_requirements": [],
+    "manual_checklist": [],
+    "harness_constraints": [
+      "Commands must be deterministic and workspace-relative.",
+      "Stage must emit evidence for gate review."
+    ],
+    "artifact_contracts": [
+      {
+        "path": "docs/stage-1-report.json",
+        "format": "json",
+        "required_keys": ["summary", "validation"],
+        "required_substrings": []
+      }
+    ]
+  },
+  {
+    "name": "stage-2-api-guardrails",
+    "objective": "Apply request validation and error-handling guardrails for critical API endpoints.",
+    "scope_hint": ["src/api", "src/validators", "src/errors"],
+    "test_commands": ["pytest tests/api"],
+    "lint_commands": ["ruff check src tests"],
+    "perf_checks": [],
+    "gate_commands_remote": [],
+    "remote_gate_contracts": [],
+    "execution_env": "local_only",
+    "requires_remote": false,
+    "sync_strategy": "local_only",
+    "required_inputs": ["auth_core_ready"],
+    "produces_artifacts": ["api_guardrails_ready"],
+    "expected_artifact_paths": ["docs/stage-2-report.json"],
+    "blocking_decisions": [],
+    "rollback_requirements": [],
+    "manual_checklist": [],
+    "harness_constraints": [
+      "Generic smoke cannot replace stage-specific evidence.",
+      "Stage pass requires deterministic evidence artifacts."
+    ],
+    "artifact_contracts": [
+      {
+        "path": "docs/stage-2-report.json",
+        "format": "json",
+        "required_keys": ["summary", "validation"],
+        "required_substrings": []
+      }
+    ]
+  }
+]
