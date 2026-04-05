@@ -180,8 +180,8 @@ def test_main_maps_cli_args_to_runtime_config(monkeypatch, tmp_path: Path) -> No
     assert cfg.max_round_per_stage == 1
     assert cfg.remote_host == "node0"
     assert cfg.remote_workdir == "/enjia/repo"
-    assert cfg.remote_workdir_node1 == "/enjia/repo"
-    assert cfg.split_worker_remote_hosts is True
+    assert cfg.remote_workdir_secondary == "/enjia/repo"
+    assert cfg.split_worker_remote_endpoints is True
     assert cfg.auto_approve_decisions == ["foo", "bar"]
     assert cfg.owner_worker == "worker_b"
     assert cfg.triage_require_reject_rationale is False

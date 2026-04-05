@@ -423,6 +423,24 @@ def test_build_monitor_view_exposes_timeout_recovery_summary_counts() -> None:
     assert view["timeout_recovery"]["recent_events"][0]["event"] == "timeout_recovery"
 
 
+def test_build_monitor_view_empty_runtime_shows_not_started_pipeline() -> None:
+    view = build_monitor_view(
+        {
+            "runtime_dir": "/tmp/runtime",
+            "runtime_status": {},
+            "summary": {},
+            "stage_dashboards": [],
+        }
+    )
+
+    assert view["overall_state"] == "pending"
+    assert view["current"]["phase"] == "not_started"
+    assert view["current"]["phase_label"] == "尚未启动"
+    assert view["current"]["phase_goal"] == "等待开始执行"
+    assert view["current"]["phase_progress"] == 0
+    assert all(node["state"] == "pending" for node in view["pipeline_nodes"])
+
+
 def test_build_monitor_view_marks_timeout_recovery_alerts(monkeypatch) -> None:
     monkeypatch.setenv("MULTI_CODEX_TIMEOUT_RECOVERY_ALERT_MIN_ATTEMPTS", "3")
     monkeypatch.setenv("MULTI_CODEX_TIMEOUT_RECOVERY_ALERT_FAILURE_RATE_PCT", "50")
@@ -630,6 +648,54 @@ def test_render_monitor_html_contains_timeout_recovery_alert_hooks() -> None:
     assert "timeout-recovery-thresholds" in html
     assert "timeout-recovery-alerting" in html
     assert "recovery-alert-item" in html
+
+
+def test_render_monitor_html_contains_intake_session_update_hooks() -> None:
+    html = render_monitor_html(
+        {
+            "runtime_dir": "/tmp/runtime",
+            "runtime_status": {},
+            "summary": {},
+            "stage_dashboards": [],
+        }
+    )
+    assert "保存会话配置" in html
+    assert "./api/intake/session/update" in html
+    assert "saveIntakeSessionEdits" in html
+    assert "intake-target-repo-list" in html
+    assert "addTargetRepoInput" in html
+    assert "removeTargetRepoInput" in html
+
+
+def test_render_monitor_html_secondary_remote_payload_requires_explicit_workdir() -> None:
+    html = render_monitor_html(
+        {
+            "runtime_dir": "/tmp/runtime",
+            "runtime_status": {},
+            "summary": {},
+            "stage_dashboards": [],
+        }
+    )
+    assert "workdir: secondaryWorkdir," in html
+    assert "secondaryWorkdir || primaryWorkdir" not in html
+    assert "secondaryUserRaw && secondaryUserRaw !== \"root\"" in html
+
+
+def test_render_monitor_html_remote_checkbox_is_right_aligned_inline() -> None:
+    html = render_monitor_html(
+        {
+            "runtime_dir": "/tmp/runtime",
+            "runtime_status": {},
+            "summary": {},
+            "stage_dashboards": [],
+        }
+    )
+    assert ".intake-field input:not([type=\"checkbox\"])" in html
+    assert "class=\"intake-field intake-checkbox\"" in html
+    assert "<label for=\"intake-need-remote\">" in html
+    assert "<span>需要服务器环境验证</span>" in html
+    assert "margin-left: auto" in html
+    assert "justify-content: flex-end" in html
 
 
 def test_build_monitor_view_includes_sli_metrics_and_alerts() -> None:

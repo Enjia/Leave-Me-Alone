@@ -28,8 +28,8 @@ def test_build_default_flow_dependencies_creates_default_ports() -> None:
             output_file=runtime_dir / "summary.json",
             remote_host="node0",
             remote_workdir="/enjia/repo",
-            remote_host_node1="node1",
-            remote_workdir_node1="/enjia/repo",
+            remote_host_secondary="node1",
+            remote_workdir_secondary="/enjia/repo",
         )
         manager = WorkspaceManager(target_repo=repo, runtime_dir=runtime_dir)
 

@@ -8,7 +8,7 @@ from adapters import check_runner as check_runner_module
 from adapters.check_runner import DefaultCheckRunner
 
 
-def test_default_check_runner_can_split_worker_remote_hosts(monkeypatch) -> None:
+def test_default_check_runner_can_split_worker_remote_endpoints(monkeypatch) -> None:
     observed_checks: dict[str, str] = {}
     observed_preflight: dict[str, str] = {}
 
@@ -19,8 +19,8 @@ def test_default_check_runner_can_split_worker_remote_hosts(monkeypatch) -> None
         *,
         remote_host: str = "",
         remote_workdir: str = "",
-        remote_host_node1: str = "",
-        remote_workdir_node1: str = "",
+        remote_host_secondary: str = "",
+        remote_workdir_secondary: str = "",
         **kwargs: object,
     ) -> object:
         del worker, stage, workspace, kwargs
@@ -28,8 +28,8 @@ def test_default_check_runner_can_split_worker_remote_hosts(monkeypatch) -> None
             {
                 "remote_host": remote_host,
                 "remote_workdir": remote_workdir,
-                "remote_host_node1": remote_host_node1,
-                "remote_workdir_node1": remote_workdir_node1,
+                "remote_host_secondary": remote_host_secondary,
+                "remote_workdir_secondary": remote_workdir_secondary,
             }
         )
         return SimpleNamespace()
@@ -41,16 +41,16 @@ def test_default_check_runner_can_split_worker_remote_hosts(monkeypatch) -> None
         *,
         remote_host: str = "",
         remote_workdir: str = "",
-        remote_host_node1: str = "",
-        remote_workdir_node1: str = "",
+        remote_host_secondary: str = "",
+        remote_workdir_secondary: str = "",
     ) -> object:
         del worker, stage, workspace
         observed_preflight.update(
             {
                 "remote_host": remote_host,
                 "remote_workdir": remote_workdir,
-                "remote_host_node1": remote_host_node1,
-                "remote_workdir_node1": remote_workdir_node1,
+                "remote_host_secondary": remote_host_secondary,
+                "remote_workdir_secondary": remote_workdir_secondary,
             }
         )
         return SimpleNamespace()
@@ -69,19 +69,19 @@ def test_default_check_runner_can_split_worker_remote_hosts(monkeypatch) -> None
     runner = DefaultCheckRunner(
         remote_host="node0",
         remote_workdir="/workspace/project-node0",
-        remote_host_node1="node1",
-        remote_workdir_node1="/workspace/project-node1",
-        split_worker_remote_hosts=True,
+        remote_host_secondary="node1",
+        remote_workdir_secondary="/workspace/project-node1",
+        split_worker_remote_endpoints=True,
     )
-    stage = SimpleNamespace(execution_env="node0_container")
+    stage = SimpleNamespace(execution_env="remote_primary")
 
     asyncio.run(runner.run_stage_checks("worker_b", stage, Path("/tmp/worker_b")))
     asyncio.run(runner.run_remote_preflight("worker_b", stage, Path("/tmp/worker_b")))
 
     assert observed_checks["remote_host"] == "node1"
     assert observed_checks["remote_workdir"] == "/workspace/project-node1"
-    assert observed_checks["remote_host_node1"] == ""
-    assert observed_checks["remote_workdir_node1"] == ""
+    assert observed_checks["remote_host_secondary"] == ""
+    assert observed_checks["remote_workdir_secondary"] == ""
     assert observed_preflight == observed_checks
 
 
@@ -95,8 +95,8 @@ def test_default_check_runner_keeps_default_routing_without_split(monkeypatch) -
         *,
         remote_host: str = "",
         remote_workdir: str = "",
-        remote_host_node1: str = "",
-        remote_workdir_node1: str = "",
+        remote_host_secondary: str = "",
+        remote_workdir_secondary: str = "",
         **kwargs: object,
     ) -> object:
         del worker, stage, workspace, kwargs
@@ -104,8 +104,8 @@ def test_default_check_runner_keeps_default_routing_without_split(monkeypatch) -
             {
                 "remote_host": remote_host,
                 "remote_workdir": remote_workdir,
-                "remote_host_node1": remote_host_node1,
-                "remote_workdir_node1": remote_workdir_node1,
+                "remote_host_secondary": remote_host_secondary,
+                "remote_workdir_secondary": remote_workdir_secondary,
             }
         )
         return SimpleNamespace()
@@ -119,15 +119,15 @@ def test_default_check_runner_keeps_default_routing_without_split(monkeypatch) -
     runner = DefaultCheckRunner(
         remote_host="node0",
         remote_workdir="/workspace/project-node0",
-        remote_host_node1="node1",
-        remote_workdir_node1="/workspace/project-node1",
-        split_worker_remote_hosts=False,
+        remote_host_secondary="node1",
+        remote_workdir_secondary="/workspace/project-node1",
+        split_worker_remote_endpoints=False,
     )
-    stage = SimpleNamespace(execution_env="node0_container")
+    stage = SimpleNamespace(execution_env="remote_primary")
 
     asyncio.run(runner.run_stage_checks("worker_b", stage, Path("/tmp/worker_b")))
 
     assert observed["remote_host"] == "node0"
     assert observed["remote_workdir"] == "/workspace/project-node0"
-    assert observed["remote_host_node1"] == "node1"
-    assert observed["remote_workdir_node1"] == "/workspace/project-node1"
+    assert observed["remote_host_secondary"] == "node1"
+    assert observed["remote_workdir_secondary"] == "/workspace/project-node1"

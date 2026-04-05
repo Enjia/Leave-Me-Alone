@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from email.parser import BytesParser
+from email.policy import default as email_policy_default
 import html
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +12,18 @@ from pathlib import Path
 import re
 import time
 from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from app.intake import (
+    confirm_draft_to_stages_file,
+    create_session,
+    generate_stage_draft,
+    launch_confirmed_run,
+    list_sessions,
+    load_session,
+    register_uploaded_file,
+    update_session,
+)
 
 
 def _load_json(path: Path) -> dict[str, Any] | list[Any] | None:
@@ -670,6 +684,7 @@ def _render_stage_card(
 
 
 _PHASE_META: dict[str, tuple[str, str, int]] = {
+    "not_started": ("尚未启动", "等待开始执行", 0),
     "stage_start": ("阶段初始化", "准备执行计划、约束和上下文", 10),
     "remote_preflight": ("远端预检查", "确认双 worker 远端环境就绪", 20),
     "remote_preflight_failed": ("远端预检查失败", "先修复环境阻断后再继续", 20),
@@ -755,6 +770,7 @@ def _normalize_stage_status(value: str) -> str:
 
 
 _PHASE_PROGRESS_ORDER: dict[str, int] = {
+    "not_started": 0,
     "stage_start": 10,
     "remote_preflight": 20,
     "remote_preflight_failed": 20,
@@ -824,7 +840,7 @@ def _infer_phase_from_states(
         return phase
     if inferred:
         return inferred
-    return phase or "running"
+    return phase or "not_started"
 
 
 def _coerce_int(value: Any, default: int = 0) -> int:
@@ -863,6 +879,9 @@ _PHASE_TO_NODE: dict[str, str] = {
 }
 
 def _compute_pipeline_node_states(phase: str) -> dict[str, str]:
+    if phase in {"", "not_started", "pending"}:
+        return {node["id"]: "pending" for node in _PIPELINE_NODES}
+
     active_node = _PHASE_TO_NODE.get(phase, "implementation")
     states: dict[str, str] = {}
     found_active = False
@@ -1615,10 +1634,14 @@ def build_monitor_view(payload: dict[str, Any]) -> dict[str, Any]:
         "current": {
             "stage_name": current_stage_name,
             "stage_status": current_status,
-            "phase": current_phase or "running",
+            "phase": current_phase or "not_started",
             "phase_label": phase_label,
             "phase_goal": phase_goal,
-            "phase_progress": phase_progress if current_status == "running" else 100,
+            "phase_progress": (
+                phase_progress
+                if current_status == "running"
+                else (100 if current_status in {"passed", "failed", "blocked"} else 0)
+            ),
             "round": current_round,
             "max_round": max(1, _coerce_int((current_stage or {}).get("max_rounds"), 1)),
             "objective": str((current_stage or {}).get("objective", "")),
@@ -1866,6 +1889,36 @@ def render_monitor_html(
 
     .section-title {{ font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: .5px; }}
 
+    /* Interactive intake panel */
+    .intake-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .intake-field {{ display: flex; flex-direction: column; gap: 6px; }}
+    .intake-field label {{ font-size: 12px; color: var(--muted); }}
+    .intake-field input:not([type="checkbox"]),
+    .intake-field textarea {{ width: 100%; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-alt); color: var(--text); padding: 8px 10px; font-size: 13px; }}
+    .intake-field textarea {{ min-height: 72px; resize: vertical; }}
+    .target-repo-list {{ display: flex; flex-direction: column; gap: 8px; }}
+    .target-repo-input {{ width: 100%; }}
+    .target-repo-actions {{ display: flex; align-items: center; gap: 8px; margin-top: 4px; }}
+    .target-repo-actions button {{ width: 28px; height: 28px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-alt); color: var(--text); cursor: pointer; font-size: 16px; line-height: 1; }}
+    .target-repo-actions button:hover {{ border-color: var(--run); }}
+    .intake-checkbox {{ align-items: flex-end; }}
+    .intake-checkbox label {{ display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-size: 14px; line-height: 1.2; white-space: nowrap; margin-left: auto; justify-content: flex-end; }}
+    .intake-checkbox input[type="checkbox"] {{ width: auto; margin: 0; padding: 0; flex: 0 0 auto; accent-color: var(--run); }}
+    .intake-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
+    .intake-actions button {{ border-radius: 8px; border: 1px solid var(--line); background: var(--panel-alt); color: var(--text); padding: 6px 10px; font-size: 12px; cursor: pointer; }}
+    .intake-actions button:hover {{ border-color: var(--run); }}
+    .intake-status {{ margin-top: 8px; font-size: 12px; color: var(--muted); white-space: pre-wrap; }}
+    .intake-status.error {{ color: var(--bad); }}
+    .intake-status.ok {{ color: var(--ok); }}
+    .intake-draft {{ margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-alt); padding: 10px; font-size: 12px; line-height: 1.45; max-height: 300px; overflow: auto; white-space: pre-wrap; word-break: break-word; }}
+    .remote-validation-panel {{ margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #101a2d; display: none; }}
+    .remote-server-grid {{ display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 8px; }}
+    .password-row {{ display: flex; gap: 6px; }}
+    .password-row input {{ flex: 1; }}
+    .password-row button {{ border-radius: 8px; border: 1px solid var(--line); background: var(--panel-alt); color: var(--text); padding: 0 8px; font-size: 12px; cursor: pointer; }}
+    @media (max-width: 700px) {{ .intake-grid {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 700px) {{ .remote-server-grid {{ grid-template-columns: 1fr; }} }}
+
     ul {{ margin: 6px 0 0 16px; padding: 0; }}
   </style>
 </head>
@@ -1896,6 +1949,96 @@ def render_monitor_html(
     <!-- Cost summary inline -->
     <div id="cost-summary" style="margin-top:6px; font-size:13px; color:var(--muted); display:none;"></div>
     <div id="sli-summary" style="margin-top:4px; font-size:13px; color:var(--muted); display:none;"></div>
+  </section>
+
+  <section class="card">
+    <div class="section-title">交互式需求分析（Intake）</div>
+    <div class="intake-grid">
+      <div class="intake-field" style="grid-column: 1 / -1;">
+        <label>目标仓库绝对路径（支持多个）</label>
+        <div id="intake-target-repo-list" class="target-repo-list"></div>
+        <div class="target-repo-actions">
+          <button type="button" onclick="addTargetRepoInput()" title="新增目标仓库路径">+</button>
+          <button type="button" onclick="removeTargetRepoInput()" title="删除最后一个目标仓库路径">-</button>
+        </div>
+      </div>
+      <div class="intake-field" style="grid-column: 1 / -1;">
+        <label for="intake-goal">目标描述</label>
+        <textarea id="intake-goal" placeholder="描述你希望系统最终实现的功能目标"></textarea>
+      </div>
+      <div class="intake-field intake-checkbox" style="grid-column: 1 / -1;">
+        <label for="intake-need-remote">
+          <input id="intake-need-remote" type="checkbox" onchange="toggleRemoteValidationInputs()">
+          <span>需要服务器环境验证</span>
+        </label>
+      </div>
+      <div class="intake-field">
+        <label for="intake-files">上传文件或目录（可多选）</label>
+        <input id="intake-files" type="file" multiple webkitdirectory directory>
+      </div>
+      <div class="intake-field">
+        <label for="intake-feedback">反馈（用于重生草案）</label>
+        <textarea id="intake-feedback" placeholder="例如：请拆成3个阶段，先做API契约，再做实现，再做回归"></textarea>
+      </div>
+    </div>
+
+    <div class="remote-validation-panel" id="remote-validation-panel">
+      <div class="section-title" style="margin-bottom:8px;">服务器连接信息</div>
+      <div class="small" style="margin-bottom:8px;">仅在勾选“需要服务器环境验证”后使用。</div>
+      <div class="remote-server-grid">
+        <div class="intake-field">
+          <label for="remote-primary-host">服务器 1 IP/Host</label>
+          <input id="remote-primary-host" type="text" placeholder="10.0.0.1">
+        </div>
+        <div class="intake-field">
+          <label for="remote-primary-user">服务器 1 登录名</label>
+          <input id="remote-primary-user" type="text" placeholder="root" value="root">
+        </div>
+        <div class="intake-field">
+          <label for="remote-primary-password">服务器 1 密码</label>
+          <div class="password-row">
+            <input id="remote-primary-password" type="password" placeholder="password">
+            <button type="button" onclick="togglePasswordVisibility('remote-primary-password', this)">显示</button>
+          </div>
+        </div>
+        <div class="intake-field">
+          <label for="remote-primary-workdir">服务器 1 工作目录</label>
+          <input id="remote-primary-workdir" type="text" placeholder="/workspace/project">
+        </div>
+      </div>
+      <div class="remote-server-grid" style="margin-top:8px;">
+        <div class="intake-field">
+          <label for="remote-secondary-host">服务器 2 IP/Host（可选）</label>
+          <input id="remote-secondary-host" type="text" placeholder="10.0.0.2">
+        </div>
+        <div class="intake-field">
+          <label for="remote-secondary-user">服务器 2 登录名</label>
+          <input id="remote-secondary-user" type="text" placeholder="root" value="root">
+        </div>
+        <div class="intake-field">
+          <label for="remote-secondary-password">服务器 2 密码</label>
+          <div class="password-row">
+            <input id="remote-secondary-password" type="password" placeholder="password">
+            <button type="button" onclick="togglePasswordVisibility('remote-secondary-password', this)">显示</button>
+          </div>
+        </div>
+        <div class="intake-field">
+          <label for="remote-secondary-workdir">服务器 2 工作目录</label>
+          <input id="remote-secondary-workdir" type="text" placeholder="/workspace/project">
+        </div>
+      </div>
+    </div>
+
+    <div class="intake-actions">
+      <button type="button" onclick="startIntakeSession()">1. 创建会话</button>
+      <button type="button" onclick="saveIntakeSessionEdits()">2. 保存会话配置</button>
+      <button type="button" onclick="uploadIntakeFiles()">3. 上传附件</button>
+      <button type="button" onclick="analyzeIntake()">4. Analyze</button>
+      <button type="button" onclick="regenerateIntake()">5. 反馈重生</button>
+      <button type="button" onclick="confirmIntake()">6. 确认并启动</button>
+    </div>
+    <div class="intake-status" id="intake-status">尚未创建 intake 会话。</div>
+    <div class="intake-draft" id="intake-draft">Analyze 后会在这里显示 stage objective 与 test case 草案。</div>
   </section>
 
   <!-- Stage roadmap -->
@@ -2058,6 +2201,369 @@ def render_monitor_html(
         summary: result.summary || rawSummary,
         detail: detail || result.detail || "",
       }};
+    }}
+
+    let intakeSessionId = "";
+    function setIntakeStatus(message, isError = false) {{
+      const el = document.getElementById("intake-status");
+      if (!el) return;
+      el.textContent = message || "";
+      el.classList.remove("error", "ok");
+      el.classList.add(isError ? "error" : "ok");
+    }}
+    function addTargetRepoInput(value = "") {{
+      const container = document.getElementById("intake-target-repo-list");
+      if (!container) return;
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "target-repo-input";
+      input.placeholder = "/abs/path/to/repo";
+      input.value = String(value || "");
+      container.appendChild(input);
+    }}
+    function ensureTargetRepoInputs() {{
+      const container = document.getElementById("intake-target-repo-list");
+      if (!container) return;
+      if ((container.querySelectorAll(".target-repo-input") || []).length === 0) {{
+        addTargetRepoInput("");
+      }}
+    }}
+    function removeTargetRepoInput() {{
+      const container = document.getElementById("intake-target-repo-list");
+      if (!container) return;
+      const inputs = Array.from(container.querySelectorAll(".target-repo-input"));
+      if (inputs.length <= 1) {{
+        if (inputs.length === 1) inputs[0].value = "";
+        return;
+      }}
+      const last = inputs[inputs.length - 1];
+      if (last) last.remove();
+    }}
+    function setTargetRepoInputs(values) {{
+      const container = document.getElementById("intake-target-repo-list");
+      if (!container) return;
+      const repos = Array.isArray(values) ? values : [];
+      container.innerHTML = "";
+      if (repos.length === 0) {{
+        addTargetRepoInput("");
+        return;
+      }}
+      repos.forEach((repo) => addTargetRepoInput(String(repo || "")));
+    }}
+    function collectTargetRepos() {{
+      const container = document.getElementById("intake-target-repo-list");
+      if (!container) return [];
+      const seen = new Set();
+      return Array.from(container.querySelectorAll(".target-repo-input"))
+        .map((el) => String(el?.value || "").trim())
+        .filter((repo) => {{
+          if (!repo || seen.has(repo)) return false;
+          seen.add(repo);
+          return true;
+        }});
+    }}
+    function renderIntakeDraft(draft, session) {{
+      const draftEl = document.getElementById("intake-draft");
+      if (draftEl) {{
+        draftEl.textContent = JSON.stringify(draft || {{}}, null, 2);
+      }}
+      if (session && session.session_id) {{
+        intakeSessionId = String(session.session_id);
+      }}
+      const sessionTargetRepos = Array.isArray(session?.target_repos)
+        ? session.target_repos
+        : (session?.target_repo ? [session.target_repo] : []);
+      setTargetRepoInputs(sessionTargetRepos);
+      const remote = session?.remote_validation || {{}};
+      const enabled = Boolean(remote.enabled);
+      const checkbox = document.getElementById("intake-need-remote");
+      if (checkbox) checkbox.checked = enabled;
+      const servers = Array.isArray(remote.servers) ? remote.servers : [];
+      const primary = servers[0] || {{}};
+      const secondary = servers[1] || {{}};
+      const assignValue = (id, value) => {{
+        const el = document.getElementById(id);
+        if (el) el.value = String(value || "");
+      }};
+      assignValue("remote-primary-host", primary.host || "");
+      assignValue("remote-primary-user", primary.user || "root");
+      assignValue("remote-primary-password", primary.password || "");
+      assignValue("remote-primary-workdir", primary.workdir || "");
+      assignValue("remote-secondary-host", secondary.host || "");
+      assignValue("remote-secondary-user", secondary.user || "root");
+      assignValue("remote-secondary-password", secondary.password || "");
+      assignValue("remote-secondary-workdir", secondary.workdir || "");
+      toggleRemoteValidationInputs();
+    }}
+    function togglePasswordVisibility(inputId, buttonEl) {{
+      const input = document.getElementById(inputId);
+      if (!input) return;
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      if (buttonEl) buttonEl.textContent = reveal ? "隐藏" : "显示";
+    }}
+    function toggleRemoteValidationInputs() {{
+      const checkbox = document.getElementById("intake-need-remote");
+      const panel = document.getElementById("remote-validation-panel");
+      if (!panel) return;
+      panel.style.display = checkbox && checkbox.checked ? "block" : "none";
+    }}
+    function collectRemoteValidationPayload() {{
+      const needRemote = Boolean(document.getElementById("intake-need-remote")?.checked);
+      if (!needRemote) {{
+        return {{ enabled: false, servers: [] }};
+      }}
+      const value = (id) => String(document.getElementById(id)?.value || "").trim();
+      const primaryHost = value("remote-primary-host");
+      const primaryWorkdir = value("remote-primary-workdir");
+      const primaryUser = value("remote-primary-user") || "root";
+      const primaryPassword = value("remote-primary-password");
+      const servers = [{{
+        label: "server_1",
+        host: primaryHost,
+        user: primaryUser,
+        password: primaryPassword,
+        workdir: primaryWorkdir,
+      }}];
+      const secondaryHost = value("remote-secondary-host");
+      const secondaryUserRaw = value("remote-secondary-user");
+      const secondaryPassword = value("remote-secondary-password");
+      const secondaryWorkdir = value("remote-secondary-workdir");
+      const secondaryHasAny = Boolean(
+        secondaryHost
+        || secondaryPassword
+        || secondaryWorkdir
+        || (secondaryUserRaw && secondaryUserRaw !== "root")
+      );
+      if (secondaryHasAny) {{
+        servers.push({{
+          label: "server_2",
+          host: secondaryHost,
+          user: secondaryUserRaw || "root",
+          password: secondaryPassword,
+          workdir: secondaryWorkdir,
+        }});
+      }}
+      return {{ enabled: needRemote, servers: servers }};
+    }}
+    function validateRemoteValidationPayload(remoteValidation) {{
+      if (!remoteValidation || !remoteValidation.enabled) {{
+        return "";
+      }}
+      if (!Array.isArray(remoteValidation.servers) || remoteValidation.servers.length === 0) {{
+        return "勾选了服务器环境验证，但服务器 1 的 IP/工作目录未填写完整。";
+      }}
+      const primary = remoteValidation.servers[0] || {{}};
+      const primaryHost = String(primary.host || "").trim();
+      const primaryWorkdir = String(primary.workdir || "").trim();
+      if (!primaryHost || !primaryWorkdir) {{
+        return "服务器 1 必须同时填写 IP 和工作目录。";
+      }}
+      const secondary = remoteValidation.servers[1];
+      if (secondary) {{
+        const secondaryHost = String(secondary.host || "").trim();
+        const secondaryWorkdir = String(secondary.workdir || "").trim();
+        if (!secondaryHost) {{
+          return "服务器 2 已填写信息但缺少 IP。";
+        }}
+        if (!secondaryWorkdir) {{
+          return "服务器 2 已填写信息但缺少工作目录。";
+        }}
+      }}
+      return "";
+    }}
+    async function saveIntakeSessionEdits(options = {{}}) {{
+      const requireSession = options.requireSession !== false;
+      const requireGoal = options.requireGoal === true;
+      const quiet = options.quiet === true;
+      if (!intakeSessionId) {{
+        if (requireSession && !quiet) {{
+          setIntakeStatus("请先创建会话。", true);
+        }}
+        return false;
+      }}
+      const goalEl = document.getElementById("intake-goal");
+      const goal = String(goalEl?.value || "").trim();
+      const targetRepos = collectTargetRepos();
+      const targetRepo = targetRepos[0] || "";
+      if (requireGoal && !goal) {{
+        if (!quiet) {{
+          setIntakeStatus("请先填写目标描述。", true);
+        }}
+        return false;
+      }}
+      const remoteValidation = collectRemoteValidationPayload();
+      const remoteError = validateRemoteValidationPayload(remoteValidation);
+      if (remoteError) {{
+        if (!quiet) {{
+          setIntakeStatus(remoteError, true);
+        }}
+        return false;
+      }}
+      try {{
+        const data = await postJson("./api/intake/session/update", {{
+          session_id: intakeSessionId,
+          goal: goal,
+          target_repo: targetRepo,
+          target_repos: targetRepos,
+          remote_validation: remoteValidation,
+        }});
+        renderIntakeDraft(data.session?.draft || {{}}, data.session || null);
+        if (!quiet) {{
+          setIntakeStatus(`会话配置已保存：${{intakeSessionId}}`);
+        }}
+        return true;
+      }} catch (error) {{
+        if (!quiet) {{
+          setIntakeStatus(`保存会话配置失败：${{error.message || error}}`, true);
+        }}
+        return false;
+      }}
+    }}
+    async function postJson(url, body) {{
+      const response = await fetch(url, {{
+        method: "POST",
+        headers: {{"Content-Type": "application/json"}},
+        body: JSON.stringify(body || {{}}),
+      }});
+      const data = await response.json().catch(() => ({{ok: false, error: "invalid_json"}}));
+      if (!response.ok || data.ok === false) {{
+        throw new Error(String(data.error || `http_${{response.status}}`));
+      }}
+      return data;
+    }}
+    async function startIntakeSession() {{
+      const goalEl = document.getElementById("intake-goal");
+      const goal = String(goalEl?.value || "").trim();
+      const targetRepos = collectTargetRepos();
+      const targetRepo = targetRepos[0] || "";
+      if (!goal) {{
+        setIntakeStatus("请先填写目标描述。", true);
+        return;
+      }}
+      try {{
+        const remoteValidation = collectRemoteValidationPayload();
+        const remoteError = validateRemoteValidationPayload(remoteValidation);
+        if (remoteError) {{
+          setIntakeStatus(remoteError, true);
+          return;
+        }}
+        const data = await postJson("./api/intake/session", {{
+          goal: goal,
+          target_repo: targetRepo,
+          target_repos: targetRepos,
+          remote_validation: remoteValidation,
+        }});
+        intakeSessionId = String(data.session?.session_id || "");
+        renderIntakeDraft(data.session?.draft || {{}}, data.session || null);
+        setIntakeStatus(`会话已创建：${{intakeSessionId}}`);
+      }} catch (error) {{
+        setIntakeStatus(`创建会话失败：${{error.message || error}}`, true);
+      }}
+    }}
+    async function uploadIntakeFiles() {{
+      if (!intakeSessionId) {{
+        setIntakeStatus("请先创建会话。", true);
+        return;
+      }}
+      const fileEl = document.getElementById("intake-files");
+      const files = fileEl?.files ? Array.from(fileEl.files) : [];
+      if (files.length === 0) {{
+        setIntakeStatus("请选择至少一个文件。", true);
+        return;
+      }}
+      const formData = new FormData();
+      formData.append("session_id", intakeSessionId);
+      files.forEach((file) => {{
+        const rel = file.webkitRelativePath || file.name;
+        formData.append("files", file, rel);
+      }});
+      try {{
+        const response = await fetch("./api/intake/upload", {{
+          method: "POST",
+          body: formData,
+        }});
+        const data = await response.json().catch(() => ({{ok: false, error: "invalid_json"}}));
+        if (!response.ok || data.ok === false) {{
+          throw new Error(String(data.error || `http_${{response.status}}`));
+        }}
+        renderIntakeDraft(data.session?.draft || {{}}, data.session || null);
+        setIntakeStatus(`上传完成：${{Number(data.uploaded_count || 0)}} 个文件。`);
+      }} catch (error) {{
+        setIntakeStatus(`上传失败：${{error.message || error}}`, true);
+      }}
+    }}
+    async function analyzeIntake() {{
+      if (!intakeSessionId) {{
+        setIntakeStatus("请先创建会话。", true);
+        return;
+      }}
+      const synced = await saveIntakeSessionEdits({{ quiet: true, requireGoal: true }});
+      if (!synced) {{
+        setIntakeStatus("Analyze 前同步会话配置失败，请先保存会话配置。", true);
+        return;
+      }}
+      try {{
+        const data = await postJson("./api/intake/analyze", {{
+          session_id: intakeSessionId,
+          feedback: "",
+        }});
+        renderIntakeDraft(data.draft || {{}}, data.session || null);
+        setIntakeStatus("Analyze 完成，请确认 stage objective 与 test case。");
+      }} catch (error) {{
+        setIntakeStatus(`Analyze 失败：${{error.message || error}}`, true);
+      }}
+    }}
+    async function regenerateIntake() {{
+      if (!intakeSessionId) {{
+        setIntakeStatus("请先创建会话。", true);
+        return;
+      }}
+      const synced = await saveIntakeSessionEdits({{ quiet: true, requireGoal: true }});
+      if (!synced) {{
+        setIntakeStatus("重生前同步会话配置失败，请先保存会话配置。", true);
+        return;
+      }}
+      const feedbackEl = document.getElementById("intake-feedback");
+      const feedback = String(feedbackEl?.value || "").trim();
+      if (!feedback) {{
+        setIntakeStatus("请输入反馈后再重生。", true);
+        return;
+      }}
+      try {{
+        const data = await postJson("./api/intake/analyze", {{
+          session_id: intakeSessionId,
+          feedback: feedback,
+        }});
+        renderIntakeDraft(data.draft || {{}}, data.session || null);
+        setIntakeStatus("已根据反馈重生草案。");
+      }} catch (error) {{
+        setIntakeStatus(`重生失败：${{error.message || error}}`, true);
+      }}
+    }}
+    async function confirmIntake() {{
+      if (!intakeSessionId) {{
+        setIntakeStatus("请先创建会话并 Analyze。", true);
+        return;
+      }}
+      const synced = await saveIntakeSessionEdits({{ quiet: true, requireGoal: true }});
+      if (!synced) {{
+        setIntakeStatus("确认前同步会话配置失败，请先保存会话配置。", true);
+        return;
+      }}
+      try {{
+        const data = await postJson("./api/intake/confirm", {{
+          session_id: intakeSessionId,
+          auto_run: true,
+        }});
+        renderIntakeDraft(data.session?.draft || {{}}, data.session || null);
+        const pid = Number(data.run?.pid || 0);
+        const stagesFile = String(data.generated_stages_file || "");
+        const runHint = pid > 0 ? `后台进程 PID=${{pid}}` : "后台任务已触发";
+        setIntakeStatus(`已确认并启动执行。stages 文件：${{stagesFile}}；${{runHint}}`);
+      }} catch (error) {{
+        setIntakeStatus(`确认启动失败：${{error.message || error}}`, true);
+      }}
     }}
 
     let compareOpen = false;
@@ -2410,6 +2916,7 @@ def render_monitor_html(
       if (label) label.textContent = note;
     }}
 
+    ensureTargetRepoInputs();
     render(initialView);
 
     const isFileProtocol = window.location.protocol === "file:";
@@ -2459,8 +2966,34 @@ def write_monitor_html(runtime_dir: Path, output_html: Path | None = None) -> Pa
 
 def _build_monitor_http_handler(runtime_dir: Path, refresh_sec: float) -> type[BaseHTTPRequestHandler]:
     class _MonitorHttpHandler(BaseHTTPRequestHandler):
+        def _split_path(self) -> tuple[str, dict[str, list[str]]]:
+            parsed = urlparse(self.path)
+            return parsed.path, parse_qs(parsed.query)
+
+        def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json_body(self) -> dict[str, Any]:
+            raw_length = self.headers.get("Content-Length", "0").strip() or "0"
+            length = max(0, int(raw_length))
+            if length <= 0:
+                return {}
+            payload = self.rfile.read(length)
+            if not payload:
+                return {}
+            parsed = json.loads(payload.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("JSON body must be an object")
+            return parsed
+
         def do_GET(self) -> None:
-            if self.path in ("/", "/index.html"):
+            route, query = self._split_path()
+            if route in ("/", "/index.html"):
                 payload = build_monitor_payload(runtime_dir)
                 body = render_monitor_html(
                     payload,
@@ -2473,7 +3006,7 @@ def _build_monitor_http_handler(runtime_dir: Path, refresh_sec: float) -> type[B
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path == "/api/payload":
+            if route == "/api/payload":
                 payload = build_monitor_payload(runtime_dir)
                 body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
@@ -2482,7 +3015,7 @@ def _build_monitor_http_handler(runtime_dir: Path, refresh_sec: float) -> type[B
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path == "/api/view":
+            if route == "/api/view":
                 view = build_monitor_view(build_monitor_payload(runtime_dir))
                 body = json.dumps(view, ensure_ascii=False, indent=2).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
@@ -2491,7 +3024,35 @@ def _build_monitor_http_handler(runtime_dir: Path, refresh_sec: float) -> type[B
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path == "/events":
+            if route == "/api/intake/session":
+                session_id = (query.get("session_id") or [""])[0].strip()
+                if not session_id:
+                    self._send_json(
+                        {"ok": False, "error": "session_id is required"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                try:
+                    session = load_session(runtime_dir, session_id)
+                except FileNotFoundError:
+                    self._send_json(
+                        {"ok": False, "error": f"session not found: {session_id}"},
+                        status=HTTPStatus.NOT_FOUND,
+                    )
+                    return
+                self._send_json({"ok": True, "session": session})
+                return
+            if route == "/api/intake/sessions":
+                limit = 20
+                if query.get("limit"):
+                    try:
+                        limit = max(1, min(200, int((query.get("limit") or ["20"])[0])))
+                    except ValueError:
+                        limit = 20
+                sessions = list_sessions(runtime_dir, limit=limit)
+                self._send_json({"ok": True, "sessions": sessions})
+                return
+            if route == "/events":
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -2518,7 +3079,7 @@ def _build_monitor_http_handler(runtime_dir: Path, refresh_sec: float) -> type[B
                         time.sleep(interval)
                 except (BrokenPipeError, ConnectionResetError):
                     return
-            if self.path == "/healthz":
+            if route == "/healthz":
                 body = b"ok\n"
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -2527,6 +3088,238 @@ def _build_monitor_http_handler(runtime_dir: Path, refresh_sec: float) -> type[B
                 self.wfile.write(body)
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
+
+        def do_POST(self) -> None:
+            route, query = self._split_path()
+            try:
+                if route == "/api/intake/session":
+                    payload = self._read_json_body()
+                    goal = str(payload.get("goal", "")).strip()
+                    target_repo = str(payload.get("target_repo", "")).strip()
+                    target_repos_payload: list[str] | None = None
+                    if payload.get("target_repos") is not None:
+                        if not isinstance(payload.get("target_repos"), list):
+                            self._send_json(
+                                {"ok": False, "error": "target_repos must be an array"},
+                                status=HTTPStatus.BAD_REQUEST,
+                            )
+                            return
+                        target_repos_payload = [
+                            str(item)
+                            for item in payload.get("target_repos")
+                        ]
+                    if not goal:
+                        self._send_json(
+                            {"ok": False, "error": "goal is required"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    session = create_session(
+                        runtime_dir,
+                        goal=goal,
+                        target_repo=target_repo,
+                        target_repos=target_repos_payload,
+                        model=str(payload.get("model", "gpt-5.3-codex")),
+                        sandbox_mode=str(payload.get("sandbox_mode", "workspace-write")),
+                        max_round_per_stage=int(payload.get("max_round_per_stage", 2) or 2),
+                        remote_validation=(
+                            payload.get("remote_validation")
+                            if isinstance(payload.get("remote_validation"), dict)
+                            else None
+                        ),
+                    )
+                    self._send_json({"ok": True, "session": session}, status=HTTPStatus.CREATED)
+                    return
+
+                if route == "/api/intake/session/update":
+                    payload = self._read_json_body()
+                    session_id = str(payload.get("session_id", "")).strip()
+                    if not session_id:
+                        self._send_json(
+                            {"ok": False, "error": "session_id is required"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    remote_validation_payload: dict[str, Any] | None = None
+                    if payload.get("remote_validation") is not None:
+                        if not isinstance(payload.get("remote_validation"), dict):
+                            self._send_json(
+                                {"ok": False, "error": "remote_validation must be an object"},
+                                status=HTTPStatus.BAD_REQUEST,
+                            )
+                            return
+                        remote_validation_payload = payload.get("remote_validation")
+                    target_repos_payload: list[str] | None = None
+                    if payload.get("target_repos") is not None:
+                        if not isinstance(payload.get("target_repos"), list):
+                            self._send_json(
+                                {"ok": False, "error": "target_repos must be an array"},
+                                status=HTTPStatus.BAD_REQUEST,
+                            )
+                            return
+                        target_repos_payload = [
+                            str(item)
+                            for item in payload.get("target_repos")
+                        ]
+                    session = update_session(
+                        runtime_dir,
+                        session_id=session_id,
+                        goal=(
+                            str(payload.get("goal"))
+                            if payload.get("goal") is not None
+                            else None
+                        ),
+                        target_repo=(
+                            str(payload.get("target_repo"))
+                            if payload.get("target_repo") is not None
+                            else None
+                        ),
+                        target_repos=target_repos_payload,
+                        model=(
+                            str(payload.get("model"))
+                            if payload.get("model") is not None
+                            else None
+                        ),
+                        sandbox_mode=(
+                            str(payload.get("sandbox_mode"))
+                            if payload.get("sandbox_mode") is not None
+                            else None
+                        ),
+                        max_round_per_stage=(
+                            int(payload.get("max_round_per_stage"))
+                            if payload.get("max_round_per_stage") is not None
+                            else None
+                        ),
+                        remote_validation=remote_validation_payload,
+                    )
+                    self._send_json({"ok": True, "session": session})
+                    return
+
+                if route == "/api/intake/upload":
+                    content_type = self.headers.get("Content-Type", "")
+                    if "multipart/form-data" not in content_type:
+                        self._send_json(
+                            {"ok": False, "error": "multipart/form-data is required"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    content_length = max(0, int(self.headers.get("Content-Length", "0") or 0))
+                    raw_payload = self.rfile.read(content_length) if content_length > 0 else b""
+                    mime_bytes = (
+                        f"Content-Type: {content_type}\r\n"
+                        "MIME-Version: 1.0\r\n\r\n"
+                    ).encode("utf-8") + raw_payload
+                    multipart = BytesParser(policy=email_policy_default).parsebytes(mime_bytes)
+
+                    session_id = ""
+                    file_parts: list[tuple[str, bytes]] = []
+                    for part in multipart.iter_parts():
+                        if part.get_content_disposition() != "form-data":
+                            continue
+                        field_name = str(part.get_param("name", header="content-disposition") or "")
+                        filename = part.get_filename()
+                        data = part.get_payload(decode=True) or b""
+                        if filename:
+                            file_parts.append((str(filename), data))
+                            continue
+                        if field_name == "session_id":
+                            session_id = data.decode("utf-8", errors="ignore").strip()
+
+                    if not session_id:
+                        session_id = (query.get("session_id") or [""])[0].strip()
+                    if not session_id:
+                        self._send_json(
+                            {"ok": False, "error": "session_id is required"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+
+                    uploaded: list[str] = []
+                    for filename, data in file_parts:
+                        filename = filename.strip()
+                        if not filename:
+                            continue
+                        if not data:
+                            continue
+                        rel_path = register_uploaded_file(
+                            runtime_dir,
+                            session_id=session_id,
+                            original_name=filename,
+                            payload=data,
+                        )
+                        uploaded.append(rel_path)
+
+                    session = load_session(runtime_dir, session_id)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "session_id": session_id,
+                            "uploaded_count": len(uploaded),
+                            "uploaded_files": uploaded,
+                            "session": session,
+                        }
+                    )
+                    return
+
+                if route == "/api/intake/analyze":
+                    payload = self._read_json_body()
+                    session_id = str(payload.get("session_id", "")).strip()
+                    if not session_id:
+                        self._send_json(
+                            {"ok": False, "error": "session_id is required"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    draft = generate_stage_draft(
+                        runtime_dir,
+                        session_id=session_id,
+                        feedback=str(payload.get("feedback", "")),
+                    )
+                    session = load_session(runtime_dir, session_id)
+                    self._send_json({"ok": True, "draft": draft, "session": session})
+                    return
+
+                if route == "/api/intake/confirm":
+                    payload = self._read_json_body()
+                    session_id = str(payload.get("session_id", "")).strip()
+                    if not session_id:
+                        self._send_json(
+                            {"ok": False, "error": "session_id is required"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    stages_file = confirm_draft_to_stages_file(runtime_dir, session_id=session_id)
+                    auto_run = bool(payload.get("auto_run", True))
+                    run_info: dict[str, Any] | None = None
+                    if auto_run:
+                        run_info = launch_confirmed_run(runtime_dir, session_id=session_id)
+                    session = load_session(runtime_dir, session_id)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "generated_stages_file": str(stages_file),
+                            "run": run_info or {},
+                            "session": session,
+                        }
+                    )
+                    return
+
+                self.send_error(HTTPStatus.NOT_FOUND)
+            except FileNotFoundError as exc:
+                self._send_json(
+                    {"ok": False, "error": str(exc)},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+            except ValueError as exc:
+                self._send_json(
+                    {"ok": False, "error": str(exc)},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            except Exception as exc:  # pragma: no cover - fail closed in runtime path
+                self._send_json(
+                    {"ok": False, "error": f"internal_error: {exc}"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
 
         def log_message(self, format: str, *args: object) -> None:
             del format, args

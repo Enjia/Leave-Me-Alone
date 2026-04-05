@@ -5,7 +5,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-from core.models import FeatureChecklistItem, StageSpec, StageSubgoal
+from core.models import (
+    FeatureChecklistItem,
+    StageSpec,
+    StageSubgoal,
+    normalize_execution_env,
+    normalize_sync_strategy,
+)
 from core.prompts import build_stage_source_requirements_report
 
 
@@ -75,7 +81,7 @@ def validate_stage_definition(flow: object, stage: StageSpec) -> list[str]:
         prefix
         for prefix in (
             flow.cfg.remote_workdir,
-            flow.cfg.remote_workdir_node1,
+            flow.cfg.remote_workdir_secondary,
             "/enjia/",
         )
         if prefix
@@ -87,9 +93,11 @@ def validate_stage_definition(flow: object, stage: StageSpec) -> list[str]:
                 f"{command}"
             )
 
-    if stage.execution_env == "node0_and_node1" and stage.requires_remote:
-        if stage.sync_strategy != "sync_to_node0_and_node1":
-            errors.append("dual-node remote stages must use sync_to_node0_and_node1")
+    execution_env = normalize_execution_env(stage.execution_env)
+    sync_strategy = normalize_sync_strategy(stage.sync_strategy)
+    if execution_env == "remote_primary_and_secondary" and stage.requires_remote:
+        if sync_strategy != "sync_to_remote_primary_and_secondary":
+            errors.append("dual-remote stages must use sync_to_remote_primary_and_secondary")
 
     source_report = build_stage_source_requirements_report(stage)
     if source_report.source_path:

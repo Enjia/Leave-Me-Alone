@@ -96,34 +96,57 @@ def build_run_parser() -> argparse.ArgumentParser:
         "--remote-host",
         type=str,
         default="",
-        help="SSH host for node0 remote command execution (e.g. 'node0' or 'user@host')",
+        help="SSH host for primary remote command execution (e.g. '10.0.0.1' or 'user@host')",
     )
     parser.add_argument(
         "--remote-workdir",
         type=str,
         default="",
-        help="Working directory on node0 (e.g. '/workspace/project')",
+        help="Working directory on primary remote host (e.g. '/workspace/project')",
+    )
+    parser.add_argument(
+        "--remote-host-secondary",
+        type=str,
+        dest="remote_host_secondary",
+        default="",
+        help="SSH host for secondary remote command execution",
+    )
+    parser.add_argument(
+        "--remote-workdir-secondary",
+        type=str,
+        dest="remote_workdir_secondary",
+        default="",
+        help="Working directory on secondary remote host (defaults to --remote-workdir)",
+    )
+    parser.add_argument(
+        "--split-worker-remote-endpoints",
+        action="store_true",
+        dest="split_worker_remote_endpoints",
+        help=(
+            "Route worker_a remote checks to --remote-host and worker_b checks to "
+            "--remote-host-secondary for remote_primary stages. "
+            "Use this to avoid compile contention when both workers run heavy gates."
+        ),
     )
     parser.add_argument(
         "--remote-host-node1",
         type=str,
+        dest="remote_host_secondary",
         default="",
-        help="SSH host for node1 remote command execution (for dual-node stages)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--remote-workdir-node1",
         type=str,
+        dest="remote_workdir_secondary",
         default="",
-        help="Working directory on node1 (defaults to --remote-workdir if not set)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--split-worker-remote-hosts",
         action="store_true",
-        help=(
-            "Route worker_a remote checks to --remote-host and worker_b checks to "
-            "--remote-host-node1 for node0_container stages. "
-            "Use this to avoid compile contention when both workers run heavy gates."
-        ),
+        dest="split_worker_remote_endpoints",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--auto-approve-decisions",
@@ -341,9 +364,9 @@ def main() -> None:
         opencode_extra_args=shlex.split(args.opencode_extra_args) if args.opencode_extra_args else [],
         remote_host=args.remote_host,
         remote_workdir=args.remote_workdir,
-        remote_host_node1=args.remote_host_node1,
-        remote_workdir_node1=args.remote_workdir_node1 or args.remote_workdir,
-        split_worker_remote_hosts=bool(args.split_worker_remote_hosts),
+        remote_host_secondary=args.remote_host_secondary,
+        remote_workdir_secondary=args.remote_workdir_secondary or args.remote_workdir,
+        split_worker_remote_endpoints=bool(args.split_worker_remote_endpoints),
         auto_approve_decisions=(
             [item.strip() for item in args.auto_approve_decisions.split(",") if item.strip()]
             if args.auto_approve_decisions

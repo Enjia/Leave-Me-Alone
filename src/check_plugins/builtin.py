@@ -16,6 +16,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from core.models import normalize_execution_env
 from core.checks import (
     _check_remote_workdir_exists,
     _cleanup_remote_path_sensitive_metadata,
@@ -160,9 +161,9 @@ class HarnessCheckPlugin:
             return CheckResult(plugin_name=self.name, passed=True, skipped=True, skip_reason="No harness commands configured.")
 
         stage = context.extra.get("stage")
-        execution_env = str(getattr(stage, "execution_env", "")) if stage else ""
+        execution_env = normalize_execution_env(str(getattr(stage, "execution_env", ""))) if stage else ""
         requires_remote = execution_env in (
-            "node0_container", "node1_container", "node0_and_node1",
+            "remote_primary", "remote_secondary", "remote_primary_and_secondary",
         )
 
         if requires_remote and stage is not None:
@@ -186,8 +187,8 @@ class HarnessCheckPlugin:
         heartbeat_sink: Callable[[dict[str, Any]], None] | None = context.extra.get("heartbeat_sink")
 
         effective_remote_workdir = _worker_scoped_remote_workdir(context.remote_workdir, context.worker)
-        node1_base = context.remote_workdir_node1 or context.remote_workdir
-        effective_remote_workdir_node1 = _worker_scoped_remote_workdir(node1_base, context.worker)
+        secondary_base = context.remote_workdir_secondary or context.remote_workdir
+        effective_remote_workdir_secondary = _worker_scoped_remote_workdir(secondary_base, context.worker)
 
         all_cmd_results: list[Any] = []
         remote_cmd_results: list[Any] = []
@@ -198,8 +199,8 @@ class HarnessCheckPlugin:
             stage,
             context.remote_host,
             effective_remote_workdir,
-            context.remote_host_node1,
-            effective_remote_workdir_node1,
+            context.remote_host_secondary,
+            effective_remote_workdir_secondary,
             remote_commands=commands,
         )
         if precondition_results:
@@ -213,7 +214,7 @@ class HarnessCheckPlugin:
         remote_cache_paths = _resolve_remote_cache_paths(stage)
         sync_targets = _resolve_sync_targets(
             stage, context.remote_host, effective_remote_workdir,
-            context.remote_host_node1, effective_remote_workdir_node1,
+            context.remote_host_secondary, effective_remote_workdir_secondary,
         )
         synced_targets: set[tuple[str, str]] = set()
         for host, workdir in sync_targets:
@@ -241,7 +242,7 @@ class HarnessCheckPlugin:
         # Step 2: Execute commands on remote targets
         exec_targets = _resolve_remote_targets(
             stage, context.remote_host, effective_remote_workdir,
-            context.remote_host_node1, effective_remote_workdir_node1,
+            context.remote_host_secondary, effective_remote_workdir_secondary,
         )
         remote_timeout = _resolve_effective_remote_command_timeout_sec(
             stage_budget_sec=context.stage_budget_sec,
@@ -324,8 +325,8 @@ class RemotePreflightPlugin:
                 context.workspace,
                 remote_host=context.remote_host,
                 remote_workdir=context.remote_workdir,
-                remote_host_node1=context.remote_host_node1,
-                remote_workdir_node1=context.remote_workdir_node1,
+                remote_host_secondary=context.remote_host_secondary,
+                remote_workdir_secondary=context.remote_workdir_secondary,
             )
         except Exception as exc:
             return CheckResult(

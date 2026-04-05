@@ -33,9 +33,9 @@ class RuntimeConfig:
     opencode_extra_args: list[str] = field(default_factory=list)
     remote_host: str = ""
     remote_workdir: str = ""
-    remote_host_node1: str = ""
-    remote_workdir_node1: str = ""
-    split_worker_remote_hosts: bool = False
+    remote_host_secondary: str = ""
+    remote_workdir_secondary: str = ""
+    split_worker_remote_endpoints: bool = False
     auto_approve_decisions: list[str] = field(default_factory=list)
     owner_worker: OwnerWorker = "worker_a"
     enable_convergence_signals: bool = True
@@ -55,6 +55,18 @@ class RuntimeConfig:
     run_budget_mode: RunBudgetMode = "run_only"
     context_budget_max_chars: int = 80_000
     layered_policy_file: Path | None = None
+
+    @property
+    def remote_host_node1(self) -> str:
+        return self.remote_host_secondary
+
+    @property
+    def remote_workdir_node1(self) -> str:
+        return self.remote_workdir_secondary
+
+    @property
+    def split_worker_remote_hosts(self) -> bool:
+        return self.split_worker_remote_endpoints
 
 def parse_stage_specs(stages_file: Path) -> list[StageSpec]:
     payload = json.loads(stages_file.read_text(encoding="utf-8"))

@@ -43,8 +43,8 @@ class FakeFlow:
             seed_artifacts_dir=None,
             remote_host="",
             remote_workdir="",
-            remote_host_node1="",
-            remote_workdir_node1="",
+            remote_host_secondary="",
+            remote_workdir_secondary="",
         )
     )
     agents: object = field(default_factory=lambda: SimpleAgents())
@@ -194,8 +194,8 @@ class SimpleConfig:
     seed_artifacts_dir: object
     remote_host: str
     remote_workdir: str
-    remote_host_node1: str
-    remote_workdir_node1: str
+    remote_host_secondary: str
+    remote_workdir_secondary: str
 
 
 @dataclass

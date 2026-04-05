@@ -475,8 +475,8 @@ class TestDefaultCheckRunnerPlugins:
         return DefaultCheckRunner(
             remote_host="10.0.0.1",
             remote_workdir="/remote/ws",
-            remote_host_node1="10.0.0.2",
-            remote_workdir_node1="/remote/ws1",
+            remote_host_secondary="10.0.0.2",
+            remote_workdir_secondary="/remote/ws1",
             plugin_registry=registry,
         )
 
@@ -501,11 +501,11 @@ class TestDefaultCheckRunnerPlugins:
         runner = DefaultCheckRunner(
             remote_host="10.0.0.1",
             remote_workdir="/remote/ws",
-            remote_host_node1="10.0.0.2",
-            remote_workdir_node1="/remote/ws1",
-            split_worker_remote_hosts=True,
+            remote_host_secondary="10.0.0.2",
+            remote_workdir_secondary="/remote/ws1",
+            split_worker_remote_endpoints=True,
         )
-        stage = FakeStage(execution_env="node0_container")
+        stage = FakeStage(execution_env="remote_primary")
         ctx = runner._build_check_context("worker_b", stage, Path("/tmp/ws"))
         assert ctx.remote_host == "10.0.0.2"
         assert ctx.remote_workdir == "/remote/ws1"
@@ -1035,7 +1035,7 @@ class TestHarnessCheckPluginRemotePath:
 
     @pytest.mark.asyncio
     async def test_remote_path_triggered_when_remote_host_set(self, monkeypatch):
-        """When remote_host is set and execution_env is node0_container,
+        """When remote_host is set and execution_env is remote_primary,
         the plugin should call remote primitives instead of local _run_command_list."""
         from check_plugins.builtin import HarnessCheckPlugin
         from core.models import CheckCommandResult
@@ -1096,8 +1096,8 @@ class TestHarnessCheckPluginRemotePath:
         monkeypatch.setattr(f"{checks_mod}._resolve_effective_remote_command_timeout_sec", fake_timeout)
 
         stage = FakeStage(
-            execution_env="node0_container",
-            sync_strategy="sync_to_node0",
+            execution_env="remote_primary",
+            sync_strategy="sync_to_remote_primary",
         )
         heartbeat_sink = lambda payload: heartbeat_calls.append(payload)
         context = CheckContext(
@@ -1211,7 +1211,7 @@ class TestHarnessCheckPluginRemotePath:
         monkeypatch.setattr(f"{checks_mod}._validate_remote_preconditions", fake_validate_preconditions)
         monkeypatch.setattr(f"{checks_mod}._worker_scoped_remote_workdir", fake_worker_scoped)
 
-        stage = FakeStage(execution_env="node0_container")
+        stage = FakeStage(execution_env="remote_primary")
         context = CheckContext(
             worker="worker_a",
             stage_name="stage-precond",
@@ -1275,8 +1275,8 @@ class TestHarnessCheckPluginRemotePath:
         monkeypatch.setattr(f"{checks_mod}._resolve_effective_remote_command_timeout_sec", fake_timeout)
 
         stage = FakeStage(
-            execution_env="node0_container",
-            sync_strategy="sync_to_node0",
+            execution_env="remote_primary",
+            sync_strategy="sync_to_remote_primary",
         )
         context = CheckContext(
             worker="worker_a",
@@ -1296,14 +1296,14 @@ class TestHarnessCheckPluginRemotePath:
 
     @pytest.mark.asyncio
     async def test_remote_path_triggered_for_node1_only_endpoint(self, monkeypatch):
-        """node1_container should use remote path when only remote_host_node1 is set."""
+        """remote_secondary should use remote path when only remote_host_secondary is set."""
         from check_plugins.builtin import HarnessCheckPlugin
         from core.models import CheckCommandResult
 
         remote_exec_calls: list[tuple] = []
 
         def fail_local_run(*args, **kwargs):
-            raise AssertionError("local _run_command_list should not be used for node1_container remote path")
+            raise AssertionError("local _run_command_list should not be used for remote_secondary remote path")
 
         def fake_validate_preconditions(stage, *args, **kwargs):
             return []
@@ -1344,15 +1344,15 @@ class TestHarnessCheckPluginRemotePath:
         monkeypatch.setattr(f"{checks_mod}._resolve_remote_cache_paths", lambda *args, **kwargs: [])
         monkeypatch.setattr(f"{checks_mod}._resolve_effective_remote_command_timeout_sec", lambda **kwargs: 600)
 
-        stage = FakeStage(execution_env="node1_container", sync_strategy="sync_to_node1")
+        stage = FakeStage(execution_env="remote_secondary", sync_strategy="sync_to_remote_secondary")
         context = CheckContext(
             worker="worker_a",
             stage_name="stage-node1",
             workspace=Path("/tmp/ws"),
             remote_host="",
             remote_workdir="/remote/ws",
-            remote_host_node1="10.0.0.2",
-            remote_workdir_node1="/remote/ws1",
+            remote_host_secondary="10.0.0.2",
+            remote_workdir_secondary="/remote/ws1",
             extra={"stage": stage},
         )
 
@@ -1401,7 +1401,7 @@ class TestHarnessCheckPluginRemotePath:
         monkeypatch.setattr(f"{checks_mod}._resolve_remote_cache_paths", lambda *args, **kwargs: [])
         monkeypatch.setattr(f"{checks_mod}._resolve_effective_remote_command_timeout_sec", lambda **kwargs: 600)
 
-        stage = FakeStage(execution_env="node0_container", sync_strategy="sync_to_node0")
+        stage = FakeStage(execution_env="remote_primary", sync_strategy="sync_to_remote_primary")
         context = CheckContext(
             worker="worker_a",
             stage_name="stage-contract",

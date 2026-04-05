@@ -18,8 +18,8 @@ class CheckContext:
     gate_tier: GateTier = "fast_round"
     remote_host: str = ""
     remote_workdir: str = ""
-    remote_host_node1: str = ""
-    remote_workdir_node1: str = ""
+    remote_host_secondary: str = ""
+    remote_workdir_secondary: str = ""
     stage_budget_sec: int | None = None
     round_budget_sec: int | None = None
     phase_timeout_cap_sec: int | None = None

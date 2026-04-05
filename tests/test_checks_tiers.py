@@ -18,6 +18,60 @@ def _passed(command: str) -> CheckCommandResult:
     return CheckCommandResult(command=command, exit_code=0, passed=True)
 
 
+def _endpoint() -> checks_module.RemoteEndpoint:
+    return checks_module.RemoteEndpoint(
+        display_host="10.0.0.1",
+        ssh_host="10.0.0.1",
+        user="root",
+        port=2222,
+        password="",
+    )
+
+
+def test_ssh_transport_enforces_host_key_checks_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("MULTI_CODEX_REMOTE_SSH_INSECURE_SKIP_HOST_KEY_CHECK", raising=False)
+    monkeypatch.delenv("MULTI_CODEX_REMOTE_SSH_KNOWN_HOSTS_FILE", raising=False)
+
+    ssh_base = checks_module._build_ssh_base(_endpoint())
+    assert "StrictHostKeyChecking=yes" in ssh_base
+    assert "StrictHostKeyChecking=no" not in ssh_base
+    assert "UserKnownHostsFile=/dev/null" not in ssh_base
+
+    rsync_transport = checks_module._build_rsync_ssh_transport(_endpoint())
+    assert "StrictHostKeyChecking=yes" in rsync_transport
+    assert "StrictHostKeyChecking=no" not in rsync_transport
+    assert "UserKnownHostsFile=/dev/null" not in rsync_transport
+
+
+def test_ssh_transport_allows_explicit_insecure_override(monkeypatch) -> None:
+    monkeypatch.setenv("MULTI_CODEX_REMOTE_SSH_INSECURE_SKIP_HOST_KEY_CHECK", "1")
+    monkeypatch.setenv("MULTI_CODEX_REMOTE_SSH_KNOWN_HOSTS_FILE", "/tmp/known_hosts")
+
+    ssh_base = checks_module._build_ssh_base(_endpoint())
+    assert "StrictHostKeyChecking=no" in ssh_base
+    assert "UserKnownHostsFile=/dev/null" in ssh_base
+    assert "StrictHostKeyChecking=yes" not in ssh_base
+    assert "UserKnownHostsFile=/tmp/known_hosts" not in ssh_base
+
+    rsync_transport = checks_module._build_rsync_ssh_transport(_endpoint())
+    assert "StrictHostKeyChecking=no" in rsync_transport
+    assert "UserKnownHostsFile=/dev/null" in rsync_transport
+
+
+def test_ssh_transport_uses_known_hosts_override_in_secure_mode(monkeypatch) -> None:
+    monkeypatch.delenv("MULTI_CODEX_REMOTE_SSH_INSECURE_SKIP_HOST_KEY_CHECK", raising=False)
+    monkeypatch.setenv("MULTI_CODEX_REMOTE_SSH_KNOWN_HOSTS_FILE", "/tmp/known_hosts")
+
+    ssh_base = checks_module._build_ssh_base(_endpoint())
+    assert "StrictHostKeyChecking=yes" in ssh_base
+    assert "UserKnownHostsFile=/tmp/known_hosts" in ssh_base
+    assert "UserKnownHostsFile=/dev/null" not in ssh_base
+
+    rsync_transport = checks_module._build_rsync_ssh_transport(_endpoint())
+    assert "StrictHostKeyChecking=yes" in rsync_transport
+    assert "UserKnownHostsFile=/tmp/known_hosts" in rsync_transport
+
+
 def test_run_checks_filters_remote_commands_and_contracts_by_tier(monkeypatch, tmp_path: Path) -> None:
     executed_batches: list[list[str]] = []
 
@@ -30,10 +84,10 @@ def test_run_checks_filters_remote_commands_and_contracts_by_tier(monkeypatch, t
     monkeypatch.setattr(
         checks_module,
         "_validate_remote_preconditions",
-        lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="", *, remote_commands=None: [],
+        lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="", *, remote_commands=None: [],
     )
-    monkeypatch.setattr(checks_module, "_resolve_sync_targets", lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="": [])
-    monkeypatch.setattr(checks_module, "_resolve_remote_targets", lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="": [(remote_host, remote_workdir)])
+    monkeypatch.setattr(checks_module, "_resolve_sync_targets", lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="": [])
+    monkeypatch.setattr(checks_module, "_resolve_remote_targets", lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="": [(remote_host, remote_workdir)])
     monkeypatch.setattr(checks_module, "_check_remote_workdir_exists", lambda host, workdir: _passed(f"[remote:{host}] preflight test -d {workdir}"))
 
     def _run_remote_command_list(
@@ -55,7 +109,7 @@ def test_run_checks_filters_remote_commands_and_contracts_by_tier(monkeypatch, t
         acceptance_criteria=["done"],
         invariants=["safe"],
         requires_remote=True,
-        execution_env="node0_container",
+        execution_env="remote_primary",
         gate_commands_remote_tiered=[
             TieredGateCommand(command="echo fast", tier="fast_round"),
             TieredGateCommand(command="echo heavy", tier="pre_promotion"),
@@ -105,10 +159,10 @@ def test_run_checks_uses_min_budget_for_remote_timeout(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(
         checks_module,
         "_validate_remote_preconditions",
-        lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="", *, remote_commands=None: [],
+        lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="", *, remote_commands=None: [],
     )
-    monkeypatch.setattr(checks_module, "_resolve_sync_targets", lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="": [])
-    monkeypatch.setattr(checks_module, "_resolve_remote_targets", lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="": [(remote_host, remote_workdir)])
+    monkeypatch.setattr(checks_module, "_resolve_sync_targets", lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="": [])
+    monkeypatch.setattr(checks_module, "_resolve_remote_targets", lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="": [(remote_host, remote_workdir)])
     monkeypatch.setattr(checks_module, "_check_remote_workdir_exists", lambda host, workdir: _passed(f"[remote:{host}] preflight test -d {workdir}"))
 
     def _run_remote_command_list(
@@ -130,7 +184,7 @@ def test_run_checks_uses_min_budget_for_remote_timeout(monkeypatch, tmp_path: Pa
         acceptance_criteria=["done"],
         invariants=["safe"],
         requires_remote=True,
-        execution_env="node0_container",
+        execution_env="remote_primary",
         gate_commands_remote_tiered=[
             TieredGateCommand(command="echo fast", tier="fast_round"),
         ],
@@ -381,19 +435,19 @@ def test_run_checks_can_preserve_cache_by_build_strategy(monkeypatch, tmp_path: 
     monkeypatch.setattr(
         checks_module,
         "_validate_remote_preconditions",
-        lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="", *, remote_commands=None: [],
+        lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="", *, remote_commands=None: [],
     )
     monkeypatch.setattr(
         checks_module,
         "_resolve_sync_targets",
-        lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="": [
+        lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="": [
             (remote_host, remote_workdir)
         ],
     )
     monkeypatch.setattr(
         checks_module,
         "_resolve_remote_targets",
-        lambda stage, remote_host, remote_workdir, remote_host_node1="", remote_workdir_node1="": [
+        lambda stage, remote_host, remote_workdir, remote_host_secondary="", remote_workdir_secondary="": [
             (remote_host, remote_workdir)
         ],
     )
@@ -432,8 +486,8 @@ def test_run_checks_can_preserve_cache_by_build_strategy(monkeypatch, tmp_path: 
         acceptance_criteria=["done"],
         invariants=["safe"],
         requires_remote=True,
-        execution_env="node0_container",
-        sync_strategy="sync_to_node0",
+        execution_env="remote_primary",
+        sync_strategy="sync_to_remote_primary",
         build_strategy=BuildStrategyProfile(
             preserve_remote_cache_default=False,
             preserve_remote_cache_tiers=["fast_round"],

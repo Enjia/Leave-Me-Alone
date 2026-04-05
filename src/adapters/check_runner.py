@@ -10,7 +10,7 @@ from check_plugins.plugin import CheckContext
 from check_plugins.profiles import extract_commands_from_stage, resolve_plugins_for_tier
 from check_plugins.registry import CheckPluginRegistry
 from core.checks import run_checks_from_stage_spec_async, run_remote_preflight_from_stage_spec_async
-from core.models import AutoCheckResult, GateTier
+from core.models import AutoCheckResult, GateTier, normalize_execution_env
 
 class DefaultCheckRunner:
     def __init__(
@@ -18,37 +18,37 @@ class DefaultCheckRunner:
         *,
         remote_host: str,
         remote_workdir: str,
-        remote_host_node1: str,
-        remote_workdir_node1: str,
-        split_worker_remote_hosts: bool = False,
+        remote_host_secondary: str,
+        remote_workdir_secondary: str,
+        split_worker_remote_endpoints: bool = False,
         plugin_registry: CheckPluginRegistry | None = None,
     ) -> None:
         self.remote_host = remote_host
         self.remote_workdir = remote_workdir
-        self.remote_host_node1 = remote_host_node1
-        self.remote_workdir_node1 = remote_workdir_node1
-        self.split_worker_remote_hosts = split_worker_remote_hosts
+        self.remote_host_secondary = remote_host_secondary
+        self.remote_workdir_secondary = remote_workdir_secondary
+        self.split_worker_remote_endpoints = split_worker_remote_endpoints
         self.plugin_registry = plugin_registry or create_default_registry()
     def _resolve_worker_remote_endpoints(self, worker: str, stage: object) -> tuple[str, str, str, str]:
-        stage_execution_env = str(getattr(stage, "execution_env", ""))
+        stage_execution_env = normalize_execution_env(str(getattr(stage, "execution_env", "")))
         should_split = (
-            self.split_worker_remote_hosts
-            and stage_execution_env == "node0_container"
+            self.split_worker_remote_endpoints
+            and stage_execution_env == "remote_primary"
             and worker == "worker_b"
-            and bool(self.remote_host_node1)
+            and bool(self.remote_host_secondary)
         )
         if should_split:
             return (
-                self.remote_host_node1,
-                self.remote_workdir_node1 or self.remote_workdir,
+                self.remote_host_secondary,
+                self.remote_workdir_secondary or self.remote_workdir,
                 "",
                 "",
             )
         return (
             self.remote_host,
             self.remote_workdir,
-            self.remote_host_node1,
-            self.remote_workdir_node1,
+            self.remote_host_secondary,
+            self.remote_workdir_secondary,
         )
 
     async def run_stage_checks(
@@ -63,7 +63,7 @@ class DefaultCheckRunner:
         phase_timeout_cap_sec: int | None = None,
         heartbeat_sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> object:
-        remote_host, remote_workdir, remote_host_node1, remote_workdir_node1 = (
+        remote_host, remote_workdir, remote_host_secondary, remote_workdir_secondary = (
             self._resolve_worker_remote_endpoints(worker, stage)
         )
         return await run_checks_from_stage_spec_async(
@@ -72,8 +72,8 @@ class DefaultCheckRunner:
             workspace,
             remote_host=remote_host,
             remote_workdir=remote_workdir,
-            remote_host_node1=remote_host_node1,
-            remote_workdir_node1=remote_workdir_node1,
+            remote_host_secondary=remote_host_secondary,
+            remote_workdir_secondary=remote_workdir_secondary,
             gate_tier=gate_tier,
             stage_budget_sec=stage_budget_sec,
             round_budget_sec=round_budget_sec,
@@ -82,7 +82,7 @@ class DefaultCheckRunner:
         )
 
     async def run_remote_preflight(self, worker: str, stage: object, workspace: Path) -> object:
-        remote_host, remote_workdir, remote_host_node1, remote_workdir_node1 = (
+        remote_host, remote_workdir, remote_host_secondary, remote_workdir_secondary = (
             self._resolve_worker_remote_endpoints(worker, stage)
         )
         return await run_remote_preflight_from_stage_spec_async(
@@ -91,8 +91,8 @@ class DefaultCheckRunner:
             workspace,
             remote_host=remote_host,
             remote_workdir=remote_workdir,
-            remote_host_node1=remote_host_node1,
-            remote_workdir_node1=remote_workdir_node1,
+            remote_host_secondary=remote_host_secondary,
+            remote_workdir_secondary=remote_workdir_secondary,
         )
 
     # ------------------------------------------------------------------
@@ -111,7 +111,7 @@ class DefaultCheckRunner:
         phase_timeout_cap_sec: int | None = None,
     ) -> CheckContext:
         """Build a CheckContext from the runner's configuration and call args."""
-        remote_host, remote_workdir, remote_host_node1, remote_workdir_node1 = (
+        remote_host, remote_workdir, remote_host_secondary, remote_workdir_secondary = (
             self._resolve_worker_remote_endpoints(worker, stage)
         )
         return CheckContext(
@@ -121,8 +121,8 @@ class DefaultCheckRunner:
             gate_tier=gate_tier,
             remote_host=remote_host,
             remote_workdir=remote_workdir,
-            remote_host_node1=remote_host_node1,
-            remote_workdir_node1=remote_workdir_node1,
+            remote_host_secondary=remote_host_secondary,
+            remote_workdir_secondary=remote_workdir_secondary,
             stage_budget_sec=stage_budget_sec,
             round_budget_sec=round_budget_sec,
             phase_timeout_cap_sec=phase_timeout_cap_sec,

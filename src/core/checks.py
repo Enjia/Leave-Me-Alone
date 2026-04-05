@@ -24,6 +24,8 @@ from core.models import (
     RemoteGateContract,
     StageGate,
     StageSpec,
+    normalize_execution_env,
+    normalize_sync_strategy,
 )
 
 
@@ -34,11 +36,6 @@ except ImportError:  # pragma: no cover - non-posix fallback
     fcntl = None  # type: ignore[assignment]
 
 MAX_OUTPUT_CHARS = 8000
-DEV_ENV_REMOTE_SCRIPT = (
-    Path.home() / ".codex/skills/dev-env-verify/scripts/dev_env_remote.sh"
-)
-DEV_ENV_CONTROL_DIR = Path("/tmp/devenv-ssh-control")
-DEV_ENV_KNOWN_HOSTS = DEV_ENV_CONTROL_DIR / "known_hosts"
 
 ALLOWED_EXECUTABLES: frozenset[str] = frozenset({
     # Test runners
@@ -71,13 +68,6 @@ DENIED_ARGUMENTS: frozenset[str] = frozenset({
     "-c", "--command", "-e", "--eval", "exec",
 })
 
-NODE_ALIAS_DEFAULTS: dict[str, tuple[str, str, int, str]] = {
-    "node0": ("10.236.220.127", "root", 2022, "Qwe123!@#"),
-    "node1": ("10.236.221.9", "root", 2022, "Qwe123!@#"),
-}
-
-DEFAULT_CONTAINER_WORKDIR_PREFIX = "/enjia"
-DEFAULT_ALIAS_HOST_SYNC_PREFIX = "/root/enjia"
 REMOTE_PATH_SENSITIVE_METADATA_PATTERNS: tuple[str, ...] = (
     "build/obj/collectives/device/Makefile.rules",
     "build/obj/collectives/device/*.dep",
@@ -242,30 +232,43 @@ def _resolve_remote_endpoint(remote_host: str) -> RemoteEndpoint:
             password="",
         )
 
-    alias = host.lower()
-    if alias in NODE_ALIAS_DEFAULTS:
-        default_ip, default_user, default_port, default_password = NODE_ALIAS_DEFAULTS[alias]
-        user = os.getenv(f"MULTI_CODEX_{alias.upper()}_SSH_USER", default_user).strip() or default_user
-        port = _read_int_env(f"MULTI_CODEX_{alias.upper()}_SSH_PORT", default_port)
-        password = os.getenv(
-            f"MULTI_CODEX_{alias.upper()}_SSH_PASSWORD",
-            default_password,
-        ).strip()
-        return RemoteEndpoint(
-            display_host=host,
-            ssh_host=default_ip,
-            user=user,
-            port=port,
-            password=password,
-        )
-
     parsed_user = ""
     parsed_host = host
     if "@" in host:
         parsed_user, parsed_host = host.split("@", 1)
+
+    parsed_port = 0
+    if ":" in parsed_host and parsed_host.count(":") == 1:
+        maybe_host, maybe_port = parsed_host.rsplit(":", 1)
+        if maybe_port.isdigit():
+            parsed_host = maybe_host
+            parsed_port = int(maybe_port)
+
     user = parsed_user or os.getenv("MULTI_CODEX_REMOTE_SSH_USER", "root").strip() or "root"
-    port = _read_int_env("MULTI_CODEX_REMOTE_SSH_PORT", 22)
-    password = os.getenv("MULTI_CODEX_REMOTE_SSH_PASSWORD", "").strip()
+    port = parsed_port if parsed_port > 0 else _read_int_env("MULTI_CODEX_REMOTE_SSH_PORT", 22)
+
+    password_map_raw = os.getenv("MULTI_CODEX_REMOTE_SSH_PASSWORDS_JSON", "").strip()
+    password_map: dict[str, str] = {}
+    if password_map_raw:
+        try:
+            parsed_map = json.loads(password_map_raw)
+            if isinstance(parsed_map, dict):
+                for key, value in parsed_map.items():
+                    if isinstance(key, str) and isinstance(value, str):
+                        password_map[key.strip()] = value.strip()
+        except json.JSONDecodeError:
+            password_map = {}
+
+    lookup_keys = [host, parsed_host, f"{user}@{parsed_host}"]
+    password = ""
+    for key in lookup_keys:
+        candidate = password_map.get(key.strip(), "").strip()
+        if candidate:
+            password = candidate
+            break
+    if not password:
+        password = os.getenv("MULTI_CODEX_REMOTE_SSH_PASSWORD", "").strip()
+
     return RemoteEndpoint(
         display_host=host,
         ssh_host=parsed_host,
@@ -275,34 +278,39 @@ def _resolve_remote_endpoint(remote_host: str) -> RemoteEndpoint:
     )
 
 
-def _build_ssh_base(endpoint: RemoteEndpoint) -> list[str]:
-    command: list[str] = []
-    if endpoint.password:
-        command.extend(["sshpass", "-p", endpoint.password])
-    command.extend(
-        [
-            "ssh",
+def _resolve_ssh_transport_options() -> list[str]:
+    insecure_skip_host_key_check = _read_bool_env(
+        "MULTI_CODEX_REMOTE_SSH_INSECURE_SKIP_HOST_KEY_CHECK",
+        False,
+    )
+    if insecure_skip_host_key_check:
+        return [
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
             "ConnectTimeout=10",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
         ]
-    )
-    alias = endpoint.display_host.strip().lower()
-    if alias in NODE_ALIAS_DEFAULTS:
-        DEV_ENV_CONTROL_DIR.mkdir(parents=True, exist_ok=True)
-        command.extend(
-            [
-                "-o",
-                "ControlMaster=auto",
-                "-o",
-                f"ControlPath={DEV_ENV_CONTROL_DIR / f'ctl-{endpoint.user}-{endpoint.ssh_host}-{endpoint.port}'}",
-                "-o",
-                "ControlPersist=30m",
-                "-o",
-                f"UserKnownHostsFile={DEV_ENV_KNOWN_HOSTS}",
-            ]
-        )
+
+    options = [
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=10",
+    ]
+    known_hosts_file = os.getenv("MULTI_CODEX_REMOTE_SSH_KNOWN_HOSTS_FILE", "").strip()
+    if known_hosts_file:
+        options.extend(["-o", f"UserKnownHostsFile={known_hosts_file}"])
+    return options
+
+
+def _build_ssh_base(endpoint: RemoteEndpoint) -> list[str]:
+
+    command: list[str] = []
+    if endpoint.password:
+        command.extend(["sshpass", "-p", endpoint.password])
+    command.extend(["ssh", *_resolve_ssh_transport_options()])
     command.extend(
         [
             "-p",
@@ -314,30 +322,8 @@ def _build_ssh_base(endpoint: RemoteEndpoint) -> list[str]:
 
 
 def _build_rsync_ssh_transport(endpoint: RemoteEndpoint) -> str:
-    parts = [
-        "ssh",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=10",
-    ]
-    alias = endpoint.display_host.strip().lower()
-    if alias in NODE_ALIAS_DEFAULTS:
-        DEV_ENV_CONTROL_DIR.mkdir(parents=True, exist_ok=True)
-        parts.extend(
-            [
-                "-o",
-                "ControlMaster=auto",
-                "-o",
-                f"ControlPath={DEV_ENV_CONTROL_DIR / f'ctl-{endpoint.user}-{endpoint.ssh_host}-{endpoint.port}'}",
-                "-o",
-                "ControlPersist=30m",
-                "-o",
-                f"UserKnownHostsFile={DEV_ENV_KNOWN_HOSTS}",
-            ]
-        )
-    parts.extend(["-p", str(endpoint.port)])
-    return " ".join(parts)
+    parts = ["ssh", *_resolve_ssh_transport_options(), "-p", str(endpoint.port)]
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def _validate_command(command: str) -> list[str]:
@@ -578,26 +564,12 @@ def _run_remote_management_command(
     remote_command: str,
     timeout: int = 20,
 ) -> CheckCommandResult:
-    alias = remote_host.strip().lower()
-    if alias in NODE_ALIAS_DEFAULTS and DEV_ENV_REMOTE_SCRIPT.exists():
-        local_command = [
-            str(DEV_ENV_REMOTE_SCRIPT),
-            "--node",
-            alias,
-            "--workdir",
-            remote_workdir,
-            "--cmd",
-            remote_command,
-        ]
-        display_host = remote_host
-        missing_message = "dev_env_remote.sh not found in PATH"
-    else:
-        endpoint = _resolve_remote_endpoint(remote_host)
-        local_command = _build_ssh_base(endpoint) + [
-            f"cd {shlex.quote(remote_workdir)} && {remote_command}",
-        ]
-        display_host = endpoint.display_host
-        missing_message = "ssh not found in PATH"
+    endpoint = _resolve_remote_endpoint(remote_host)
+    local_command = _build_ssh_base(endpoint) + [
+        f"cd {shlex.quote(remote_workdir)} && {remote_command}",
+    ]
+    display_host = endpoint.display_host
+    missing_message = "ssh not found in PATH"
     try:
         proc = subprocess.run(
             local_command,
@@ -839,22 +811,6 @@ def _run_remote_command(
                 passed=False,
             )
 
-    alias = remote_host.strip().lower()
-    if alias in NODE_ALIAS_DEFAULTS and DEV_ENV_REMOTE_SCRIPT.exists():
-        script_command = [
-            str(DEV_ENV_REMOTE_SCRIPT),
-            "--node",
-            alias,
-            "--workdir",
-            remote_workdir,
-            "--cmd",
-            tracked_command,
-        ]
-        return _run_process(
-            script_command,
-            missing_message="dev_env_remote.sh not found in PATH",
-        )
-
     endpoint = _resolve_remote_endpoint(remote_host)
     ssh_command = _build_ssh_base(endpoint) + [
         f"cd {shlex.quote(remote_workdir)} && {tracked_command}",
@@ -894,31 +850,8 @@ def _run_remote_command_list(
 
 
 def _resolve_sync_remote_path(remote_host: str, remote_path: str) -> str:
-    """Map container workdir path to host-mounted path for node aliases."""
-    normalized_path = remote_path.strip()
-    alias = remote_host.strip().lower()
-    if alias not in NODE_ALIAS_DEFAULTS:
-        return normalized_path
-    if not normalized_path.startswith("/"):
-        return normalized_path
-
-    container_prefix = os.getenv(
-        f"MULTI_CODEX_{alias.upper()}_CONTAINER_WORKDIR_PREFIX",
-        DEFAULT_CONTAINER_WORKDIR_PREFIX,
-    ).strip() or DEFAULT_CONTAINER_WORKDIR_PREFIX
-    host_prefix = os.getenv(
-        f"MULTI_CODEX_{alias.upper()}_HOST_SYNC_PREFIX",
-        DEFAULT_ALIAS_HOST_SYNC_PREFIX,
-    ).strip() or DEFAULT_ALIAS_HOST_SYNC_PREFIX
-
-    container_prefix = container_prefix.rstrip("/") or "/"
-    host_prefix = host_prefix.rstrip("/") or "/"
-
-    if normalized_path == container_prefix:
-        return host_prefix
-    if normalized_path.startswith(f"{container_prefix}/"):
-        return host_prefix + normalized_path[len(container_prefix) :]
-    return normalized_path
+    del remote_host
+    return remote_path.strip()
 
 
 def _remote_sync_lock_file_path(remote_host: str, sync_remote_path: str) -> Path:
@@ -1198,22 +1131,22 @@ def _resolve_remote_targets(
     stage: StageSpec,
     remote_host: str,
     remote_workdir: str,
-    remote_host_node1: str = "",
-    remote_workdir_node1: str = "",
+    remote_host_secondary: str = "",
+    remote_workdir_secondary: str = "",
 ) -> list[tuple[str, str]]:
     """Return list of (host, workdir) pairs based on execution_env."""
     targets: list[tuple[str, str]] = []
-    env = stage.execution_env
+    env = normalize_execution_env(stage.execution_env)
 
-    if env == "node0_container" and remote_host:
+    if env == "remote_primary" and remote_host:
         targets.append((remote_host, remote_workdir or str(Path.cwd())))
-    elif env == "node1_container" and remote_host_node1:
-        targets.append((remote_host_node1, remote_workdir_node1 or remote_workdir or str(Path.cwd())))
-    elif env == "node0_and_node1":
+    elif env == "remote_secondary" and remote_host_secondary:
+        targets.append((remote_host_secondary, remote_workdir_secondary or remote_workdir or str(Path.cwd())))
+    elif env == "remote_primary_and_secondary":
         if remote_host:
             targets.append((remote_host, remote_workdir or str(Path.cwd())))
-        if remote_host_node1:
-            targets.append((remote_host_node1, remote_workdir_node1 or remote_workdir or str(Path.cwd())))
+        if remote_host_secondary:
+            targets.append((remote_host_secondary, remote_workdir_secondary or remote_workdir or str(Path.cwd())))
 
     return targets
 
@@ -1230,8 +1163,8 @@ def _validate_remote_preconditions(
     stage: StageSpec,
     remote_host: str,
     remote_workdir: str,
-    remote_host_node1: str = "",
-    remote_workdir_node1: str = "",
+    remote_host_secondary: str = "",
+    remote_workdir_secondary: str = "",
     *,
     remote_commands: list[str] | None = None,
 ) -> list[CheckCommandResult]:
@@ -1239,49 +1172,50 @@ def _validate_remote_preconditions(
         return []
 
     errors: list[CheckCommandResult] = []
+    env = normalize_execution_env(stage.execution_env)
 
-    if stage.execution_env == "node0_container":
+    if env == "remote_primary":
         if not remote_host:
             errors.append(_failed_check(
-                "remote-precondition:node0",
-                "Stage requires node0 remote execution but --remote-host was not provided.",
+                "remote-precondition:primary",
+                "Stage requires primary remote execution but --remote-host was not provided.",
             ))
         if not remote_workdir:
             errors.append(_failed_check(
-                "remote-precondition:node0-workdir",
-                "Stage requires node0 remote execution but --remote-workdir was not provided.",
+                "remote-precondition:primary-workdir",
+                "Stage requires primary remote execution but --remote-workdir was not provided.",
             ))
-    elif stage.execution_env == "node1_container":
-        if not remote_host_node1:
+    elif env == "remote_secondary":
+        if not remote_host_secondary:
             errors.append(_failed_check(
-                "remote-precondition:node1",
-                "Stage requires node1 remote execution but --remote-host-node1 was not provided.",
+                "remote-precondition:secondary",
+                "Stage requires secondary remote execution but --remote-host-secondary was not provided.",
             ))
-        if not (remote_workdir_node1 or remote_workdir):
+        if not (remote_workdir_secondary or remote_workdir):
             errors.append(_failed_check(
-                "remote-precondition:node1-workdir",
-                "Stage requires node1 remote execution but no node1 workdir was provided.",
+                "remote-precondition:secondary-workdir",
+                "Stage requires secondary remote execution but no secondary workdir was provided.",
             ))
-    elif stage.execution_env == "node0_and_node1":
+    elif env == "remote_primary_and_secondary":
         if not remote_host:
             errors.append(_failed_check(
-                "remote-precondition:node0",
-                "Stage requires node0 remote execution but --remote-host was not provided.",
+                "remote-precondition:primary",
+                "Stage requires primary remote execution but --remote-host was not provided.",
             ))
-        if not remote_host_node1:
+        if not remote_host_secondary:
             errors.append(_failed_check(
-                "remote-precondition:node1",
-                "Stage requires node1 remote execution but --remote-host-node1 was not provided.",
+                "remote-precondition:secondary",
+                "Stage requires secondary remote execution but --remote-host-secondary was not provided.",
             ))
         if not remote_workdir:
             errors.append(_failed_check(
-                "remote-precondition:node0-workdir",
-                "Stage requires node0 remote execution but --remote-workdir was not provided.",
+                "remote-precondition:primary-workdir",
+                "Stage requires primary remote execution but --remote-workdir was not provided.",
             ))
-        if not (remote_workdir_node1 or remote_workdir):
+        if not (remote_workdir_secondary or remote_workdir):
             errors.append(_failed_check(
-                "remote-precondition:node1-workdir",
-                "Stage requires node1 remote execution but no node1 workdir was provided.",
+                "remote-precondition:secondary-workdir",
+                "Stage requires secondary remote execution but no secondary workdir was provided.",
             ))
 
     return errors
@@ -1291,20 +1225,22 @@ def _resolve_sync_targets(
     stage: StageSpec,
     remote_host: str,
     remote_workdir: str,
-    remote_host_node1: str = "",
-    remote_workdir_node1: str = "",
+    remote_host_secondary: str = "",
+    remote_workdir_secondary: str = "",
 ) -> list[tuple[str, str]]:
     """Return list of (host, workdir) pairs to sync based on sync_strategy."""
-    strategy = stage.sync_strategy
+    strategy = normalize_sync_strategy(stage.sync_strategy)
     targets: list[tuple[str, str]] = []
 
-    if strategy in ("sync_to_node0",) and remote_host:
+    if strategy in ("sync_to_remote_primary",) and remote_host:
         targets.append((remote_host, remote_workdir or str(Path.cwd())))
-    elif strategy == "sync_to_node0_and_node1":
+    elif strategy == "sync_to_remote_secondary" and remote_host_secondary:
+        targets.append((remote_host_secondary, remote_workdir_secondary or remote_workdir or str(Path.cwd())))
+    elif strategy == "sync_to_remote_primary_and_secondary":
         if remote_host:
             targets.append((remote_host, remote_workdir or str(Path.cwd())))
-        if remote_host_node1:
-            targets.append((remote_host_node1, remote_workdir_node1 or remote_workdir or str(Path.cwd())))
+        if remote_host_secondary:
+            targets.append((remote_host_secondary, remote_workdir_secondary or remote_workdir or str(Path.cwd())))
 
     return targets
 
@@ -1316,62 +1252,6 @@ def _check_remote_workdir_exists(
 ) -> CheckCommandResult:
     """Fail fast if the remote execution workdir is missing."""
     command = f"test -d {shlex.quote(remote_workdir)}"
-    alias = remote_host.strip().lower()
-    if alias in NODE_ALIAS_DEFAULTS and DEV_ENV_REMOTE_SCRIPT.exists():
-        script_command = [
-            str(DEV_ENV_REMOTE_SCRIPT),
-            "--node",
-            alias,
-            "--workdir",
-            "/",
-            "--cmd",
-            command,
-        ]
-        try:
-            proc = subprocess.run(
-                script_command,
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return CheckCommandResult(
-                command=f"[remote:{remote_host}] preflight {command}",
-                exit_code=-1,
-                stdout="",
-                stderr=f"TIMEOUT: remote preflight exceeded {timeout}s limit",
-                passed=False,
-            )
-        except FileNotFoundError:
-            return CheckCommandResult(
-                command=f"[remote:{remote_host}] preflight {command}",
-                exit_code=-3,
-                stdout="",
-                stderr="dev_env_remote.sh not found in PATH",
-                passed=False,
-            )
-        stderr = proc.stderr[:MAX_OUTPUT_CHARS] if proc.stderr else ""
-        if proc.returncode != 0:
-            message = (
-                f"Remote workdir missing or inaccessible: {remote_workdir}. "
-                f"preflight command failed: {command}"
-            )
-            if stderr:
-                message = f"{message}\n{stderr}"
-            return _failed_check(
-                f"[remote:{remote_host}] preflight {command}",
-                message,
-                exit_code=proc.returncode,
-            )
-        return CheckCommandResult(
-            command=f"[remote:{remote_host}] preflight {command}",
-            exit_code=proc.returncode,
-            stdout=proc.stdout[:MAX_OUTPUT_CHARS] if proc.stdout else "",
-            stderr=stderr,
-            passed=True,
-        )
-
     endpoint = _resolve_remote_endpoint(remote_host)
     ssh_command = _build_ssh_base(endpoint) + [command]
     try:
@@ -1657,8 +1537,8 @@ def run_remote_preflight_from_stage_spec(
     workspace: Path,
     remote_host: str = "",
     remote_workdir: str = "",
-    remote_host_node1: str = "",
-    remote_workdir_node1: str = "",
+    remote_host_secondary: str = "",
+    remote_workdir_secondary: str = "",
 ) -> list[CheckCommandResult]:
     """Validate remote stage prerequisites before worker delivery starts.
 
@@ -1667,15 +1547,15 @@ def run_remote_preflight_from_stage_spec(
     agent budget producing code for a run that can never pass its remote gate.
     """
     effective_remote_workdir = _worker_scoped_remote_workdir(remote_workdir, worker)
-    node1_base = remote_workdir_node1 or remote_workdir
-    effective_remote_workdir_node1 = _worker_scoped_remote_workdir(node1_base, worker)
+    secondary_base = remote_workdir_secondary or remote_workdir
+    effective_remote_workdir_secondary = _worker_scoped_remote_workdir(secondary_base, worker)
 
     results = _validate_remote_preconditions(
         stage,
         remote_host,
         effective_remote_workdir,
-        remote_host_node1,
-        effective_remote_workdir_node1,
+        remote_host_secondary,
+        effective_remote_workdir_secondary,
         remote_commands=stage.gate_commands_remote,
     )
     if results:
@@ -1685,8 +1565,8 @@ def run_remote_preflight_from_stage_spec(
         stage,
         remote_host,
         effective_remote_workdir,
-        remote_host_node1,
-        effective_remote_workdir_node1,
+        remote_host_secondary,
+        effective_remote_workdir_secondary,
     )
     synced_targets: set[tuple[str, str]] = set()
     for host, workdir in sync_targets:
@@ -1721,8 +1601,8 @@ def run_remote_preflight_from_stage_spec(
         stage,
         remote_host,
         effective_remote_workdir,
-        remote_host_node1,
-        effective_remote_workdir_node1,
+        remote_host_secondary,
+        effective_remote_workdir_secondary,
     )
     for host, workdir in exec_targets:
         if sync_targets and (host, workdir) not in synced_targets:
@@ -1755,8 +1635,8 @@ def run_checks_from_stage_spec(
     workspace: Path,
     remote_host: str = "",
     remote_workdir: str = "",
-    remote_host_node1: str = "",
-    remote_workdir_node1: str = "",
+    remote_host_secondary: str = "",
+    remote_workdir_secondary: str = "",
     gate_tier: GateTier = "fast_round",
     stage_budget_sec: int | None = None,
     round_budget_sec: int | None = None,
@@ -1767,14 +1647,14 @@ def run_checks_from_stage_spec(
 
     Respects execution_env and sync_strategy:
     - Syncs workspace to remote targets before running remote commands.
-    - Executes selected tier gate commands on all nodes dictated by execution_env.
+    - Executes selected tier gate commands on all remote endpoints dictated by execution_env.
     - Local commands (test_commands, lint_commands, perf_checks) run locally.
     """
     effective_remote_workdir = _worker_scoped_remote_workdir(remote_workdir, worker)
-    node1_base = remote_workdir_node1 or remote_workdir
-    effective_remote_workdir_node1 = _worker_scoped_remote_workdir(node1_base, worker)
+    secondary_base = remote_workdir_secondary or remote_workdir
+    effective_remote_workdir_secondary = _worker_scoped_remote_workdir(secondary_base, worker)
 
-    remote_path_candidates = [effective_remote_workdir, effective_remote_workdir_node1]
+    remote_path_candidates = [effective_remote_workdir, effective_remote_workdir_secondary]
     harness_results = _validate_local_command_harness(
         stage.test_commands + stage.lint_commands + stage.perf_checks,
         remote_path_candidates,
@@ -1797,8 +1677,8 @@ def run_checks_from_stage_spec(
         stage,
         remote_host,
         effective_remote_workdir,
-        remote_host_node1,
-        effective_remote_workdir_node1,
+        remote_host_secondary,
+        effective_remote_workdir_secondary,
         remote_commands=selected_remote_commands,
     )
     harness_results.extend(remote_precondition_results)
@@ -1809,7 +1689,7 @@ def run_checks_from_stage_spec(
         # Step 1: Sync workspace to remote targets based on sync_strategy
         sync_targets = _resolve_sync_targets(
             stage, remote_host, effective_remote_workdir,
-            remote_host_node1, effective_remote_workdir_node1,
+            remote_host_secondary, effective_remote_workdir_secondary,
         )
         synced_targets: set[tuple[str, str]] = set()
         for host, workdir in sync_targets:
@@ -1838,7 +1718,7 @@ def run_checks_from_stage_spec(
         # Step 2: Execute remote commands on all execution targets
         exec_targets = _resolve_remote_targets(
             stage, remote_host, effective_remote_workdir,
-            remote_host_node1, effective_remote_workdir_node1,
+            remote_host_secondary, effective_remote_workdir_secondary,
         )
         remote_command_timeout_sec = _resolve_effective_remote_command_timeout_sec(
             stage_budget_sec=stage_budget_sec,
@@ -1907,8 +1787,8 @@ async def run_checks_from_stage_spec_async(
     workspace: Path,
     remote_host: str = "",
     remote_workdir: str = "",
-    remote_host_node1: str = "",
-    remote_workdir_node1: str = "",
+    remote_host_secondary: str = "",
+    remote_workdir_secondary: str = "",
     gate_tier: GateTier = "fast_round",
     stage_budget_sec: int | None = None,
     round_budget_sec: int | None = None,
@@ -1919,7 +1799,7 @@ async def run_checks_from_stage_spec_async(
         run_checks_from_stage_spec,
         worker, stage, workspace,
         remote_host, remote_workdir,
-        remote_host_node1, remote_workdir_node1,
+        remote_host_secondary, remote_workdir_secondary,
         gate_tier,
         stage_budget_sec,
         round_budget_sec,
@@ -1934,8 +1814,8 @@ async def run_remote_preflight_from_stage_spec_async(
     workspace: Path,
     remote_host: str = "",
     remote_workdir: str = "",
-    remote_host_node1: str = "",
-    remote_workdir_node1: str = "",
+    remote_host_secondary: str = "",
+    remote_workdir_secondary: str = "",
 ) -> list[CheckCommandResult]:
     return await asyncio.to_thread(
         run_remote_preflight_from_stage_spec,
@@ -1944,6 +1824,6 @@ async def run_remote_preflight_from_stage_spec_async(
         workspace,
         remote_host,
         remote_workdir,
-        remote_host_node1,
-        remote_workdir_node1,
+        remote_host_secondary,
+        remote_workdir_secondary,
     )

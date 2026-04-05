@@ -89,7 +89,7 @@ def build_harness_spec_snapshot(flow: object) -> HarnessSpecSnapshot:
             HarnessStageProfile(
                 profile_id="design_probe",
                 stage_types=["design_probe"],
-                execution_envs=["local_only", "node0_container"],
+                execution_envs=["local_only", "remote_primary"],
                 required_artifacts=["stage_spec_snapshot", "context_packet", "worker_plan"],
                 preferred_validation_gates=["stage_gate", "plan_gate", "verifier_review", "judge_gate"],
                 retry_bias="conservative",
@@ -99,7 +99,7 @@ def build_harness_spec_snapshot(flow: object) -> HarnessSpecSnapshot:
             HarnessStageProfile(
                 profile_id="implementation",
                 stage_types=["implementation"],
-                execution_envs=["local_only", "node0_container", "node1_container"],
+                execution_envs=["local_only", "remote_primary", "remote_secondary"],
                 required_artifacts=["worker_plan", "check_summary", "task_handoff"],
                 preferred_validation_gates=["plan_gate", "remote_preflight", "artifact_contract", "judge_gate"],
                 retry_bias="balanced",
@@ -109,7 +109,7 @@ def build_harness_spec_snapshot(flow: object) -> HarnessSpecSnapshot:
             HarnessStageProfile(
                 profile_id="integration",
                 stage_types=["integration", "full_regression"],
-                execution_envs=["node0_container", "node1_container", "node0_and_node1"],
+                execution_envs=["remote_primary", "remote_secondary", "remote_primary_and_secondary"],
                 required_artifacts=["worker_plan", "check_summary", "verifier_report", "promotion_readiness"],
                 preferred_validation_gates=["plan_gate", "remote_preflight", "remote_gate", "artifact_contract", "verifier_review", "judge_gate", "promotion_readiness"],
                 retry_bias="conservative",

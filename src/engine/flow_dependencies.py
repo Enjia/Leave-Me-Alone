@@ -30,9 +30,9 @@ def build_default_flow_dependencies(
         check_runner=DefaultCheckRunner(
             remote_host=cfg.remote_host,
             remote_workdir=cfg.remote_workdir,
-            remote_host_node1=cfg.remote_host_node1,
-            remote_workdir_node1=cfg.remote_workdir_node1,
-            split_worker_remote_hosts=cfg.split_worker_remote_hosts,
+            remote_host_secondary=cfg.remote_host_secondary,
+            remote_workdir_secondary=cfg.remote_workdir_secondary,
+            split_worker_remote_endpoints=cfg.split_worker_remote_endpoints,
         ),
         artifact_store=FileArtifactStore(
             runtime_dir=cfg.runtime_dir,

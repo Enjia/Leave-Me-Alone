@@ -89,13 +89,36 @@ The monitor now includes dedicated sections for:
 - `stage-gate drift` status
 - the active governance policy snapshot
 
+### Interactive Intake (Experimental)
+
+When monitor runs in `--serve` mode, you can use an interactive intake panel:
+
+1. Fill in one or more target repository absolute paths and your goal (use `+`/`-` to add or remove paths; the first path is the primary execution repo).
+2. Optional: enable `需要服务器环境验证`; only then the UI asks for server IP, login, password, and workdir.
+3. Upload files/folders as context input.
+4. Click `Analyze` to auto-generate stage objective + textual test cases.
+5. If not satisfied, add feedback and click `反馈重生`.
+6. Click `确认并启动` to generate stages JSON and launch background run.
+
+`Analyze` is model-first (Codex CLI) with deterministic heuristic fallback when model generation is unavailable.
+Intake planner now performs mandatory full-content analysis on uploaded attachments (text files as full text; binary/non-UTF8 files as full base64 payload).
+Set `MULTI_CODEX_INTAKE_ENABLE_MODEL=0` to force deterministic fallback.
+
+Generated files are persisted under:
+
+- `<runtime-dir>/intake/sessions/*.json`
+- `<runtime-dir>/intake/generated/*.stages.json`
+- `<runtime-dir>/intake/runs/*.log`
+
+`target_repos` is stored in the intake session; the first entry is used as the primary execution repo.
+
 ## Harness Engineering Constraints
 
 This orchestrator treats `StageSpec` as the immutable contract and the judge's
 `StageGate` as a refinement layer, not a replacement. In practice:
 
 - Local commands must be workspace-relative and must not reference remote workdirs.
-- Remote stages fail fast if required nodes/workdirs are not configured.
+- Remote stages fail fast if required remote endpoints/workdirs are not configured.
 - Sync failures block remote gate execution for the affected target.
 - Stage pass is revoked if declared evidence artifacts are missing or violate their contracts.
 - Judge fallback is fail-closed: if structured gate review fails, the stage does not pass.
@@ -175,7 +198,7 @@ When `--enable-a2a` is set but endpoints are unavailable, delegation falls back 
 ## Long-Run Recommendations (Remote)
 
 - Use `--auto-approve-decisions` for stages with `blocking_decisions`; otherwise the flow exits with code `2` and writes a decision request JSON under `.runtime/artifacts`.
-- For any stage with `execution_env=node0_and_node1`, always pass both `--remote-host-node1` and `--remote-workdir-node1`.
+- For any stage with `execution_env=remote_primary_and_secondary`, always pass both `--remote-host-secondary` and `--remote-workdir-secondary`.
 - Keep a deterministic owner policy (`--owner-worker worker_a|worker_b`) so stage artifacts land in `target_repo/docs/*` consistently.
 - Timeout policy defaults:
   - `MULTI_CODEX_STAGE_TIMEOUT_SEC=10800` (3h hard cap per stage)

@@ -60,6 +60,39 @@ PlanNodeKind = Literal[
     "judge_gate",
     "promotion",
 ]
+ExecutionEnv = Literal[
+    "local_only",
+    "remote_primary",
+    "remote_secondary",
+    "remote_primary_and_secondary",
+]
+SyncStrategy = Literal[
+    "local_only",
+    "sync_to_remote_primary",
+    "sync_to_remote_secondary",
+    "sync_to_remote_primary_and_secondary",
+]
+
+LEGACY_EXECUTION_ENV_ALIASES: dict[str, str] = {
+    "node0_container": "remote_primary",
+    "node1_container": "remote_secondary",
+    "node0_and_node1": "remote_primary_and_secondary",
+}
+LEGACY_SYNC_STRATEGY_ALIASES: dict[str, str] = {
+    "sync_to_node0": "sync_to_remote_primary",
+    "sync_to_node1": "sync_to_remote_secondary",
+    "sync_to_node0_and_node1": "sync_to_remote_primary_and_secondary",
+}
+
+
+def normalize_execution_env(value: str) -> str:
+    normalized = value.strip()
+    return LEGACY_EXECUTION_ENV_ALIASES.get(normalized, normalized)
+
+
+def normalize_sync_strategy(value: str) -> str:
+    normalized = value.strip()
+    return LEGACY_SYNC_STRATEGY_ALIASES.get(normalized, normalized)
 
 
 class StrictBaseModel(BaseModel):
@@ -543,9 +576,9 @@ class StageSpec(StrictBaseModel):
     remote_gate_contracts: list[RemoteGateContract] = Field(default_factory=list)
 
     # Execution environment
-    execution_env: Literal["local_only", "node0_container", "node1_container", "node0_and_node1"] = "local_only"
+    execution_env: ExecutionEnv = "local_only"
     requires_remote: bool = False
-    sync_strategy: Literal["local_only", "sync_to_node0", "sync_to_node0_and_node1"] = "local_only"
+    sync_strategy: SyncStrategy = "local_only"
 
     # Check plugin profile — maps gate_tier → plugin names.
     # When omitted the built-in defaults in check_plugins.profiles are used.
@@ -564,6 +597,20 @@ class StageSpec(StrictBaseModel):
     manual_checklist: list[str] = Field(default_factory=list)
     harness_constraints: list[str] = Field(default_factory=list)
     artifact_contracts: list[ArtifactContract] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_remote_aliases(cls, payload: object) -> object:
+        if not isinstance(payload, dict):
+            return payload
+        normalized_payload = dict(payload)
+        raw_execution_env = normalized_payload.get("execution_env")
+        if isinstance(raw_execution_env, str):
+            normalized_payload["execution_env"] = normalize_execution_env(raw_execution_env)
+        raw_sync_strategy = normalized_payload.get("sync_strategy")
+        if isinstance(raw_sync_strategy, str):
+            normalized_payload["sync_strategy"] = normalize_sync_strategy(raw_sync_strategy)
+        return normalized_payload
 
     @model_validator(mode="after")
     def _normalize_remote_gate_tiers(self) -> StageSpec:
