@@ -31,12 +31,9 @@ class DefaultCheckRunner:
         self.plugin_registry = plugin_registry or create_default_registry()
     def _resolve_worker_remote_endpoints(self, worker: str, stage: object) -> tuple[str, str, str, str]:
         stage_execution_env = normalize_execution_env(str(getattr(stage, "execution_env", "")))
-        should_split = (
-            self.split_worker_remote_endpoints
-            and stage_execution_env == "remote_primary"
-            and worker == "worker_b"
-            and bool(self.remote_host_secondary)
-        )
+        # In single-worker mode, split is no longer meaningful since there is
+        # only one worker.  Always route to the primary remote host.
+        should_split = False
         if should_split:
             return (
                 self.remote_host_secondary,

@@ -255,17 +255,17 @@ def build_verifier_payload(
     stage: StageSpec,
     stage_name: str,
     patch_a: WorkspaceArtifactsLike,
-    patch_b: WorkspaceArtifactsLike,
-    review_a_on_b: PeerReviewResult,
-    review_b_on_a: PeerReviewResult,
-    triage_a: OwnerTriageResult,
-    triage_b: OwnerTriageResult,
     check_artifact_a: CheckSummaryArtifact,
-    check_artifact_b: CheckSummaryArtifact,
     drift_a: PlanDriftArtifact,
-    drift_b: PlanDriftArtifact,
+    patch_b: WorkspaceArtifactsLike | None = None,
+    check_artifact_b: CheckSummaryArtifact | None = None,
+    drift_b: PlanDriftArtifact | None = None,
+    review_a_on_b: None = None,
+    review_b_on_a: None = None,
+    triage_a: None = None,
+    triage_b: None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "stage_name": stage_name,
         "stage_contract": {
             "invariants": list(stage.invariants),
@@ -275,85 +275,24 @@ def build_verifier_payload(
             "remote_gate_contracts": [item.model_dump() for item in stage.remote_gate_contracts],
         },
         "checks": {
-            "worker_a": check_artifact_a.model_dump(),
-            "worker_b": check_artifact_b.model_dump(),
-        },
-        "peer_reviews": {
-            "worker_a_on_b": review_a_on_b.model_dump(),
-            "worker_b_on_a": review_b_on_a.model_dump(),
-        },
-        "triage": {
-            "worker_a": triage_a.model_dump(),
-            "worker_b": triage_b.model_dump(),
+            "worker": check_artifact_a.model_dump(),
         },
         "plan_drift": {
-            "worker_a": drift_a.model_dump(),
-            "worker_b": drift_b.model_dump(),
+            "worker": drift_a.model_dump(),
         },
-        "worker_a_status": {
+        "worker_status": {
             "changed_files": patch_a.changed_files,
             "status": patch_a.status_lines,
             "patch": patch_a.review_patch or patch_a.patch,
         },
-        "worker_b_status": {
-            "changed_files": patch_b.changed_files,
-            "status": patch_b.status_lines,
-            "patch": patch_b.review_patch or patch_b.patch,
-        },
     }
-
+    return payload
 
 def build_judge_gate_payload(
     stage_name: str,
-    review_a_on_b: PeerReviewResult,
-    review_b_on_a: PeerReviewResult,
-    triage_a: OwnerTriageResult,
-    triage_b: OwnerTriageResult,
     verifier_report: VerifierReport,
 ) -> dict[str, Any]:
-    blocking_high_severity = []
-    inference_reports = []
-    to_verify_reports = []
-    disputed = []
-
-    reports_on_a_by_id = {report.report_id: report for report in review_b_on_a.reports}
-    reports_on_b_by_id = {report.report_id: report for report in review_a_on_b.reports}
-
-    for report in review_a_on_b.reports + review_b_on_a.reports:
-        if report.severity in {"S0", "S1"}:
-            certainty = report.evidence_semantics.certainty
-            if certainty == "fact":
-                blocking_high_severity.append(report.model_dump())
-            elif certainty == "inference":
-                inference_reports.append(report.model_dump())
-            else:
-                to_verify_reports.append(report.model_dump())
-
-    for decision in triage_a.decisions:
-        if decision.action == "reject" and decision.report_id in reports_on_a_by_id:
-            disputed.append(
-                {
-                    "owner": "worker_a",
-                    "decision": decision.model_dump(),
-                    "report": reports_on_a_by_id[decision.report_id].model_dump(),
-                }
-            )
-
-    for decision in triage_b.decisions:
-        if decision.action == "reject" and decision.report_id in reports_on_b_by_id:
-            disputed.append(
-                {
-                    "owner": "worker_b",
-                    "decision": decision.model_dump(),
-                    "report": reports_on_b_by_id[decision.report_id].model_dump(),
-                }
-            )
-
     return {
         "stage_name": stage_name,
         "verifier_report": verifier_report.model_dump(),
-        "blocking_high_severity_reports": blocking_high_severity,
-        "inference_reports": inference_reports,
-        "to_verify_reports": to_verify_reports,
-        "disputed_decisions": disputed,
     }

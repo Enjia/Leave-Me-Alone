@@ -258,10 +258,8 @@ class CostLedger:
         role = (agent_role or "").strip().lower()
         if not role:
             return "<unknown>"
-        if "worker_a" in role:
-            return "worker_a"
-        if "worker_b" in role:
-            return "worker_b"
+        if "worker" in role:
+            return "worker"
         if "judge" in role:
             return "judge"
         if "planner" in role:

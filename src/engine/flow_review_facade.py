@@ -6,8 +6,6 @@ from typing import Any
 from core.models import (
     CheckSummaryArtifact,
     FailureClassification,
-    OwnerTriageResult,
-    PeerReviewResult,
     PlanDriftArtifact,
     StageGate,
     StageSpec,
@@ -73,46 +71,34 @@ class FlowReviewFacadeMixin:
         stage: StageSpec,
         stage_name: str,
         patch_a: WorkspaceArtifactsLike,
-        patch_b: WorkspaceArtifactsLike,
-        review_a_on_b: PeerReviewResult,
-        review_b_on_a: PeerReviewResult,
-        triage_a: OwnerTriageResult,
-        triage_b: OwnerTriageResult,
         check_artifact_a: CheckSummaryArtifact,
-        check_artifact_b: CheckSummaryArtifact,
         drift_a: PlanDriftArtifact,
-        drift_b: PlanDriftArtifact,
+        patch_b: WorkspaceArtifactsLike | None = None,
+        check_artifact_b: CheckSummaryArtifact | None = None,
+        drift_b: PlanDriftArtifact | None = None,
+        review_a_on_b: None = None,
+        review_b_on_a: None = None,
+        triage_a: None = None,
+        triage_b: None = None,
     ) -> dict[str, Any]:
         return build_verifier_payload(
             stage=stage,
             stage_name=stage_name,
             patch_a=patch_a,
-            patch_b=patch_b,
-            review_a_on_b=review_a_on_b,
-            review_b_on_a=review_b_on_a,
-            triage_a=triage_a,
-            triage_b=triage_b,
             check_artifact_a=check_artifact_a,
-            check_artifact_b=check_artifact_b,
             drift_a=drift_a,
+            patch_b=patch_b,
+            check_artifact_b=check_artifact_b,
             drift_b=drift_b,
         )
 
     @staticmethod
     def _build_judge_gate_payload(
         stage_name: str,
-        review_a_on_b: PeerReviewResult,
-        review_b_on_a: PeerReviewResult,
-        triage_a: OwnerTriageResult,
-        triage_b: OwnerTriageResult,
         verifier_report: VerifierReport,
     ) -> dict[str, Any]:
         return build_judge_gate_payload(
             stage_name,
-            review_a_on_b,
-            review_b_on_a,
-            triage_a,
-            triage_b,
             verifier_report,
         )
 

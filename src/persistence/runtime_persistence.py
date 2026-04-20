@@ -28,12 +28,12 @@ def build_harness_spec_snapshot(flow: object) -> HarnessSpecSnapshot:
     return HarnessSpecSnapshot(
         provider=flow.cfg.provider,
         owner_worker=flow.cfg.owner_worker,
-        topology="judge + verifier + worker_a + worker_b",
+        topology="judge + judge_b + verifier + worker",
         roles=[
-            HarnessRoleSpec(role="judge", responsibility="Final gate decision, dispute resolution, pass/fail governance."),
+            HarnessRoleSpec(role="judge", responsibility="Independent gate review, pass/fail governance (primary judge)."),
+            HarnessRoleSpec(role="judge_b", responsibility="Independent gate review, pass/fail governance (secondary judge)."),
             HarnessRoleSpec(role="verifier", responsibility="Criterion-by-criterion contract audit without final gate authority."),
-            HarnessRoleSpec(role="worker_a", responsibility="Independent implementation, peer review on worker_b, owner triage for own workspace."),
-            HarnessRoleSpec(role="worker_b", responsibility="Independent implementation, peer review on worker_a, owner triage for own workspace."),
+            HarnessRoleSpec(role="worker", responsibility="Implementation, self-review, and repair based on merged judge feedback."),
             HarnessRoleSpec(role="system", responsibility="Execution planning, checks, persistence, promotion, and fail-closed control."),
         ],
         validation_gates=[

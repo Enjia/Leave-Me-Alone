@@ -21,8 +21,6 @@ from core.models import (
     FailureEventArtifact,
     FeatureChecklistArtifact,
     JudgeGateReview,
-    OwnerTriageResult,
-    PeerReviewResult,
     PlanGateReview,
     PlanDriftArtifact,
     RuntimeStatusSnapshot,
@@ -32,7 +30,6 @@ from core.models import (
     StageResult,
     StageRoundLog,
     StageSpec,
-    TriageAuditArtifact,
     VerifierReport,
     WorkerDelivery,
     WorkerEntryPacket,
@@ -40,9 +37,8 @@ from core.models import (
 )
 from core.prompts import (
     judge_gate_review_prompt,
-    owner_triage_prompt,
+    judge_independent_review_prompt,
     verifier_review_prompt,
-    worker_peer_review_prompt,
     worker_self_review_prompt,
 )
 
@@ -51,51 +47,33 @@ from core.prompts import (
 class RoundPlanApproved:
     context_packet: StageContextPacket
     context_packet_json: str
-    worker_a_entry_packet: WorkerEntryPacket
-    worker_b_entry_packet: WorkerEntryPacket
-    worker_a_plan: WorkerPlan
-    worker_b_plan: WorkerPlan
+    worker_entry_packet: WorkerEntryPacket
+    worker_plan: WorkerPlan
     plan_gate_review: PlanGateReview
-
 
 @dataclass(frozen=True)
 class RoundPlanRejected:
     judge_feedback: list[str]
 
-
 @dataclass(frozen=True)
 class RoundDeliveryPhaseResult:
-    worker_a_delivery: WorkerDelivery
-    worker_b_delivery: WorkerDelivery
-    drift_a: PlanDriftArtifact
-    drift_b: PlanDriftArtifact
-    check_summary_a: str
-    check_summary_b: str
-    check_artifact_a_post_impl: CheckSummaryArtifact
-    check_artifact_b_post_impl: CheckSummaryArtifact
-    patch_a_after_impl: WorkspaceArtifactsLike
-    patch_b_after_impl: WorkspaceArtifactsLike
-
+    worker_delivery: WorkerDelivery
+    drift: PlanDriftArtifact
+    check_summary: str
+    check_artifact_post_impl: CheckSummaryArtifact
+    patch_after_impl: WorkspaceArtifactsLike
 
 @dataclass(frozen=True)
 class RoundReviewGatePhaseResult:
-    worker_a_self_review: SelfReviewResult
-    worker_b_self_review: SelfReviewResult
-    review_a_on_b: PeerReviewResult
-    review_b_on_a: PeerReviewResult
-    triage_a: OwnerTriageResult
-    triage_b: OwnerTriageResult
-    triage_audit: TriageAuditArtifact
+    worker_self_review: SelfReviewResult
+    judge_a_gate: JudgeGateReview
+    judge_b_gate: JudgeGateReview
     verifier_report: VerifierReport
     final_gate: JudgeGateReview
-    auto_checks_a: object
-    auto_checks_b: object
-    check_summary_a: str
-    check_summary_b: str
-    check_artifact_a_post_triage: CheckSummaryArtifact
-    check_artifact_b_post_triage: CheckSummaryArtifact
-    patch_a_final: WorkspaceArtifactsLike
-    patch_b_final: WorkspaceArtifactsLike
+    auto_checks: object
+    check_summary: str
+    check_artifact_post_review: CheckSummaryArtifact
+    patch_final: WorkspaceArtifactsLike
     review_memory: list
     convergence_signal: ConvergenceSignal
     no_progress_rounds: int
@@ -103,67 +81,78 @@ class RoundReviewGatePhaseResult:
     prev_failure_signature: str
     round_log: StageRoundLog
 
-
 @dataclass(frozen=True)
 class RoundContinueResult:
     judge_feedback: list[str]
-    prev_check_summary_a: str
-    prev_check_summary_b: str
-    review_baseline_a: object
-    review_baseline_b: object
-
+    prev_check_summary: str
+    review_baseline: object
 
 @dataclass(frozen=True)
 class RoundPassResult:
     stage_result: StageResult
 
 
-async def _await_worker_deliveries(*deliveries: object) -> tuple[WorkerDelivery, WorkerDelivery]:
-    tasks = [asyncio.create_task(delivery) for delivery in deliveries]
-    try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        first_exception: BaseException | None = None
-        for task in done:
-            try:
-                task.result()
-            except BaseException as exc:
-                first_exception = exc
-                break
-        if first_exception is not None:
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            raise first_exception
-        await asyncio.gather(*pending)
-        return tuple(task.result() for task in tasks)  # type: ignore[return-value]
-    except BaseException:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+def merge_gate_decisions(
+    gate_a: JudgeGateReview,
+    gate_b: JudgeGateReview,
+    stage_name: str,
+    round_index: int,
+) -> JudgeGateReview:
+    """Deterministic merge of two independent Judge gate decisions.
+
+    Rules:
+    - Both pass -> merged pass
+    - Either fail -> merged fail
+    - required_actions = deduplicated union
+    - high_severity_open = deduplicated union
+    - disputed_items = deduplicated union
+    """
+    merged_pass = gate_a.pass_gate and gate_b.pass_gate
+    merged_actions = list(dict.fromkeys(
+        list(gate_a.required_actions or []) + list(gate_b.required_actions or [])
+    ))
+    merged_high_severity = list(dict.fromkeys(
+        list(gate_a.high_severity_open or []) + list(gate_b.high_severity_open or [])
+    ))
+    merged_disputed = list(dict.fromkeys(
+        list(gate_a.disputed_items or []) + list(gate_b.disputed_items or [])
+    ))
+
+    rationale_parts = []
+    if gate_a.rationale:
+        rationale_parts.append(f"[Judge A] {gate_a.rationale}")
+    if gate_b.rationale:
+        rationale_parts.append(f"[Judge B] {gate_b.rationale}")
+    if not merged_pass and gate_a.pass_gate != gate_b.pass_gate:
+        dissenter = "Judge B" if gate_a.pass_gate else "Judge A"
+        rationale_parts.append(f"Merged to FAIL because {dissenter} rejected.")
+
+    return JudgeGateReview(
+        stage_name=stage_name,
+        round_index=round_index,
+        pass_gate=merged_pass,
+        high_severity_open=merged_high_severity,
+        disputed_items=merged_disputed,
+        required_actions=merged_actions,
+        rationale="\n".join(rationale_parts),
+    )
+
+async def _await_worker_delivery(delivery: object) -> WorkerDelivery:
+    """Await a single worker delivery coroutine."""
+    return await delivery
 
 
-async def _capture_workspace_artifacts_pair(
+async def _capture_workspace_artifacts(
     flow: object,
     *,
-    baseline_a: WorkspaceArtifactsLike | object,
-    baseline_b: WorkspaceArtifactsLike | object,
-) -> tuple[WorkspaceArtifactsLike, WorkspaceArtifactsLike]:
-    patch_a, patch_b = await asyncio.gather(
-        asyncio.to_thread(
-            flow.workspace_port.capture_artifacts,
-            flow.agents.worker_a_workspace,
-            baseline_snapshot=baseline_a,
-        ),
-        asyncio.to_thread(
-            flow.workspace_port.capture_artifacts,
-            flow.agents.worker_b_workspace,
-            baseline_snapshot=baseline_b,
-        ),
+    baseline: WorkspaceArtifactsLike | object,
+) -> WorkspaceArtifactsLike:
+    patch = await asyncio.to_thread(
+        flow.workspace_port.capture_artifacts,
+        flow.agents.worker_workspace,
+        baseline_snapshot=baseline,
     )
-    return patch_a, patch_b
-
+    return patch
 
 _REMOTE_HEARTBEAT_FILE_LOCK = threading.Lock()
 
@@ -522,7 +511,7 @@ def _repeated_timeout_recovery_workers(
     *,
     stage_name: str,
     gate_tier: str,
-    workers: tuple[str, str] = ("worker_a", "worker_b"),
+    workers: tuple[str, ...] = ("worker",),
 ) -> list[tuple[str, int]]:
     threshold = _read_timeout_env_int(
         flow,
@@ -597,16 +586,15 @@ def _terminal_timeout_recovery_block_result(
             },
         )
     )
-    for worker in ("worker_a", "worker_b"):
-        flow._persist_task_handoff_packet(
-            flow._build_terminal_handoff_packet(
-                worker=worker,
-                stage=stage,
-                round_index=round_index,
-                final_gate=final_gate,
-                trigger="timeout_recovery",
-            )
+    flow._persist_task_handoff_packet(
+        flow._build_terminal_handoff_packet(
+            worker="worker",
+            stage=stage,
+            round_index=round_index,
+            final_gate=final_gate,
+            trigger="timeout_recovery",
         )
+    )
     flow._persist_runtime_status(
         RuntimeStatusSnapshot(
             target_repo=flow.state.target_repo,
@@ -614,7 +602,7 @@ def _terminal_timeout_recovery_block_result(
             current_round=round_index,
             phase=f"{gate_tier}_timeout_blocked",
             overall_state="blocked",
-            worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+            worker_states={"worker": "blocked"},
             judge_state="blocked_on_timeout_recovery",
             latest_artifacts=list(gate_artifact_refs),
             notes=list(final_gate.required_actions),
@@ -643,7 +631,7 @@ def _terminal_timeout_recovery_block_result(
             stage=stage,
             status="blocked",
             current_round=round_index,
-            worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+            worker_states={"worker": "blocked"},
             judge_state="blocked_on_timeout_recovery",
             unresolved_actions=list(final_gate.required_actions),
             latest_artifacts=list(gate_artifact_refs),
@@ -849,60 +837,6 @@ def _should_serialize_worker_checks(stage: StageSpec, gate_tier: str) -> bool:
     return any(_looks_like_make_command(command) for command in commands)
 
 
-async def _run_stage_checks_pair(
-    flow: object,
-    *,
-    stage: StageSpec,
-    gate_tier: str,
-    round_index: int,
-    stage_deadline_monotonic: float | None,
-) -> tuple[object, object]:
-    if _should_serialize_worker_checks(stage, gate_tier):
-        checks_a = await _run_stage_checks(
-            flow,
-            worker="worker_a",
-            stage=stage,
-            workspace=flow.agents.worker_a_workspace,
-            gate_tier=gate_tier,
-            round_index=round_index,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        )
-        checks_b = await _run_stage_checks(
-            flow,
-            worker="worker_b",
-            stage=stage,
-            workspace=flow.agents.worker_b_workspace,
-            gate_tier=gate_tier,
-            round_index=round_index,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        )
-        return checks_a, checks_b
-
-    results = await wait_first_exception(
-        _run_stage_checks(
-            flow,
-            worker="worker_a",
-            stage=stage,
-            workspace=flow.agents.worker_a_workspace,
-            gate_tier=gate_tier,
-            round_index=round_index,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
-        _run_stage_checks(
-            flow,
-            worker="worker_b",
-            stage=stage,
-            workspace=flow.agents.worker_b_workspace,
-            gate_tier=gate_tier,
-            round_index=round_index,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
-    )
-    if len(results) != 2:
-        raise RuntimeError(f"Expected 2 check results, got {len(results)}")
-    return results[0], results[1]
-
-
 async def run_round_plan_phase(
     flow: object,
     *,
@@ -910,8 +844,7 @@ async def run_round_plan_phase(
     stage_plan: StageExecutionPlan,
     round_index: int,
     judge_feedback: list[str],
-    prev_check_summary_a: str,
-    prev_check_summary_b: str,
+    prev_check_summary: str,
     review_memory: list,
     stage_deadline_monotonic: float,
 ) -> RoundPlanApproved | RoundPlanRejected:
@@ -922,7 +855,7 @@ async def run_round_plan_phase(
             current_round=round_index,
             phase="round_start",
             overall_state="running",
-            worker_states={"worker_a": "planning", "worker_b": "planning"},
+            worker_states={"worker": "planning"},
             judge_state="waiting_for_worker_plan",
             latest_artifacts=[
                 flow._stage_artifact_ref(stage.name, f"round{round_index}_context_packet.json")
@@ -935,7 +868,7 @@ async def run_round_plan_phase(
             stage=stage,
             status="running",
             current_round=round_index,
-            worker_states={"worker_a": "planning", "worker_b": "planning"},
+            worker_states={"worker": "planning"},
             judge_state="waiting_for_worker_plan",
             unresolved_actions=list(judge_feedback),
             latest_artifacts=[
@@ -953,8 +886,8 @@ async def run_round_plan_phase(
         stage_plan=stage_plan,
         round_index=round_index,
         judge_feedback=judge_feedback,
-        prev_check_summary_a=prev_check_summary_a,
-        prev_check_summary_b=prev_check_summary_b,
+        prev_check_summary_a=prev_check_summary,
+        prev_check_summary_b="",
         review_memory=review_memory,
     )
     flow._persist_context_packet(context_packet)
@@ -965,16 +898,7 @@ async def run_round_plan_phase(
     )
     flow._persist_task_handoff_packet(
         flow._build_round_start_handoff_packet(
-            worker="worker_a",
-            stage=stage,
-            round_index=round_index,
-            context_packet=context_packet,
-            review_memory=review_memory,
-        )
-    )
-    flow._persist_task_handoff_packet(
-        flow._build_round_start_handoff_packet(
-            worker="worker_b",
+            worker="worker",
             stage=stage,
             round_index=round_index,
             context_packet=context_packet,
@@ -1015,10 +939,10 @@ async def run_round_plan_phase(
         )
     current_blocker = judge_feedback[0] if judge_feedback else ""
     current_blocker_category = "planner" if judge_feedback else ""
-    worker_a_entry_packet = flow._build_worker_entry_packet(
+    worker_entry_packet = flow._build_worker_entry_packet(
         stage=stage,
         round_index=round_index,
-        worker="worker_a",
+        worker="worker",
         context_packet=context_packet,
         passed_gates=["stage_initialized", "remote_preflight", "stage_gate"],
         current_blocker=current_blocker,
@@ -1028,21 +952,7 @@ async def run_round_plan_phase(
             flow._stage_artifact_ref(stage.name, "stage_spec_snapshot.json"),
         ],
     )
-    worker_b_entry_packet = flow._build_worker_entry_packet(
-        stage=stage,
-        round_index=round_index,
-        worker="worker_b",
-        context_packet=context_packet,
-        passed_gates=["stage_initialized", "remote_preflight", "stage_gate"],
-        current_blocker=current_blocker,
-        current_blocker_category=current_blocker_category,
-        artifact_refs=[
-            flow._stage_artifact_ref(stage.name, f"round{round_index}_context_packet.json"),
-            flow._stage_artifact_ref(stage.name, "stage_spec_snapshot.json"),
-        ],
-    )
-    flow._persist_worker_entry_packet(worker_a_entry_packet)
-    flow._persist_worker_entry_packet(worker_b_entry_packet)
+    flow._persist_worker_entry_packet(worker_entry_packet)
     round_ledger = flow._build_stage_progress_ledger(
         stage=stage,
         round_index=round_index,
@@ -1050,8 +960,7 @@ async def run_round_plan_phase(
         passed_gates=["stage_initialized", "remote_preflight", "stage_gate"],
         latest_artifacts=[
             flow._stage_artifact_ref(stage.name, f"round{round_index}_context_packet.json"),
-            flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_entry_packet.json"),
-            flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_entry_packet.json"),
+            flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_entry_packet.json"),
         ],
         current_blocker=current_blocker,
         current_blocker_category=current_blocker_category,
@@ -1065,44 +974,28 @@ async def run_round_plan_phase(
         repeated_failure_points=[],
         stable_workarounds=[],
     )
-    worker_a_plan, worker_b_plan = await asyncio.gather(
-        flow._invoke_worker_plan_for_round(
-            worker_name="worker_a",
-            agent=flow.agents.worker_a,
-            workspace=flow.agents.worker_a_workspace,
-            stage=stage,
-            round_index=round_index,
-            judge_feedback=judge_feedback,
-            auto_check_summary=prev_check_summary_a,
-            context_packet_json=context_packet_json,
-            worker_entry_packet_json=json.dumps(worker_a_entry_packet.model_dump(), ensure_ascii=False, indent=2),
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
-        flow._invoke_worker_plan_for_round(
-            worker_name="worker_b",
-            agent=flow.agents.worker_b,
-            workspace=flow.agents.worker_b_workspace,
-            stage=stage,
-            round_index=round_index,
-            judge_feedback=judge_feedback,
-            auto_check_summary=prev_check_summary_b,
-            context_packet_json=context_packet_json,
-            worker_entry_packet_json=json.dumps(worker_b_entry_packet.model_dump(), ensure_ascii=False, indent=2),
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
+    worker_plan = await flow._invoke_worker_plan_for_round(
+        worker_name="worker",
+        agent=flow.agents.worker,
+        workspace=flow.agents.worker_workspace,
+        stage=stage,
+        round_index=round_index,
+        judge_feedback=judge_feedback,
+        auto_check_summary=prev_check_summary,
+        context_packet_json=context_packet_json,
+        worker_entry_packet_json=json.dumps(worker_entry_packet.model_dump(), ensure_ascii=False, indent=2),
+        stage_deadline_monotonic=stage_deadline_monotonic,
     )
     plan_gate_review = await flow._invoke_plan_gate_review(
         stage=stage,
         round_index=round_index,
         context_packet_json=context_packet_json,
-        worker_a_plan=worker_a_plan,
-        worker_b_plan=worker_b_plan,
+        worker_plan=worker_plan,
         stage_deadline_monotonic=stage_deadline_monotonic,
     )
     if not plan_gate_review.pass_gate:
         updated_feedback = (
-            list(plan_gate_review.worker_a_required_actions)
-            + list(plan_gate_review.worker_b_required_actions)
+            list(plan_gate_review.worker_required_actions)
             + list(plan_gate_review.blockers)
         )
         flow._persist_failure_event(
@@ -1129,11 +1022,10 @@ async def run_round_plan_phase(
                 current_round=round_index,
                 phase="plan_gate_review",
                 overall_state="running",
-                worker_states={"worker_a": "replan_required", "worker_b": "replan_required"},
+                worker_states={"worker": "replan_required"},
                 judge_state="plan_rejected",
                 latest_artifacts=[
-                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_plan.json"),
-                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_plan.json"),
+                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_plan.json"),
                     flow._stage_artifact_ref(stage.name, f"round{round_index}_plan_gate_review.json"),
                 ],
                 notes=["Plan gate rejected; retrying next round without implementation."],
@@ -1144,7 +1036,7 @@ async def run_round_plan_phase(
                 stage=stage,
                 status="running",
                 current_round=round_index,
-                worker_states={"worker_a": "replan_required", "worker_b": "replan_required"},
+                worker_states={"worker": "replan_required"},
                 judge_state="plan_rejected",
                 unresolved_actions=updated_feedback,
                 latest_artifacts=[
@@ -1161,11 +1053,10 @@ async def run_round_plan_phase(
             current_round=round_index,
             phase="plan_gate_review",
             overall_state="running",
-            worker_states={"worker_a": "implementing", "worker_b": "implementing"},
+            worker_states={"worker": "implementing"},
             judge_state="plan_approved",
             latest_artifacts=[
-                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_plan.json"),
-                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_plan.json"),
+                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_plan.json"),
                 flow._stage_artifact_ref(stage.name, f"round{round_index}_plan_gate_review.json"),
             ],
             notes=["Worker Plan Mode completed and plan gate approved execution."],
@@ -1176,7 +1067,7 @@ async def run_round_plan_phase(
             stage=stage,
             status="running",
             current_round=round_index,
-            worker_states={"worker_a": "implementing", "worker_b": "implementing"},
+            worker_states={"worker": "implementing"},
             judge_state="plan_approved",
             unresolved_actions=[],
             latest_artifacts=[
@@ -1187,10 +1078,8 @@ async def run_round_plan_phase(
     return RoundPlanApproved(
         context_packet=context_packet,
         context_packet_json=context_packet_json,
-        worker_a_entry_packet=worker_a_entry_packet,
-        worker_b_entry_packet=worker_b_entry_packet,
-        worker_a_plan=worker_a_plan,
-        worker_b_plan=worker_b_plan,
+        worker_entry_packet=worker_entry_packet,
+        worker_plan=worker_plan,
         plan_gate_review=plan_gate_review,
     )
 
@@ -1202,123 +1091,87 @@ async def run_round_delivery_phase(
     stage_gate: object,
     round_index: int,
     judge_feedback: list[str],
-    worker_a_plan: WorkerPlan,
-    worker_b_plan: WorkerPlan,
-    worker_a_entry_packet: WorkerEntryPacket,
-    worker_b_entry_packet: WorkerEntryPacket,
-    prev_check_summary_a: str,
-    prev_check_summary_b: str,
+    worker_plan: WorkerPlan,
+    worker_entry_packet: WorkerEntryPacket,
+    prev_check_summary: str,
     context_packet_json: str,
-    review_baseline_a: WorkspaceArtifactsLike | object,
-    review_baseline_b: WorkspaceArtifactsLike | object,
+    review_baseline: WorkspaceArtifactsLike | object,
     stage_deadline_monotonic: float,
 ) -> RoundDeliveryPhaseResult:
-    worker_a_delivery, worker_b_delivery = await _await_worker_deliveries(
+    worker_delivery = await _await_worker_delivery(
         flow._invoke_worker_delivery_for_round(
-            worker_name="worker_a",
-            agent=flow.agents.worker_a,
-            workspace=flow.agents.worker_a_workspace,
+            worker_name="worker",
+            agent=flow.agents.worker,
+            workspace=flow.agents.worker_workspace,
             stage=stage,
             stage_gate=stage_gate,
             round_index=round_index,
             judge_feedback=judge_feedback,
-            approved_plan=worker_a_plan,
-            auto_check_summary=prev_check_summary_a,
+            approved_plan=worker_plan,
+            auto_check_summary=prev_check_summary,
             context_packet_json=context_packet_json,
-            worker_entry_packet_json=json.dumps(worker_a_entry_packet.model_dump(), ensure_ascii=False, indent=2),
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
-        flow._invoke_worker_delivery_for_round(
-            worker_name="worker_b",
-            agent=flow.agents.worker_b,
-            workspace=flow.agents.worker_b_workspace,
-            stage=stage,
-            stage_gate=stage_gate,
-            round_index=round_index,
-            judge_feedback=judge_feedback,
-            approved_plan=worker_b_plan,
-            auto_check_summary=prev_check_summary_b,
-            context_packet_json=context_packet_json,
-            worker_entry_packet_json=json.dumps(worker_b_entry_packet.model_dump(), ensure_ascii=False, indent=2),
+            worker_entry_packet_json=json.dumps(worker_entry_packet.model_dump(), ensure_ascii=False, indent=2),
             stage_deadline_monotonic=stage_deadline_monotonic,
         ),
     )
-    flow._persist_worker_delivery(stage_name=stage.name, round_index=round_index, delivery=worker_a_delivery)
-    flow._persist_worker_delivery(stage_name=stage.name, round_index=round_index, delivery=worker_b_delivery)
+    flow._persist_worker_delivery(stage_name=stage.name, round_index=round_index, delivery=worker_delivery)
 
-    clean_state_a = flow._build_clean_state_artifact(
+    clean_state = flow._build_clean_state_artifact(
         stage_name=stage.name,
         round_index=round_index,
-        worker="worker_a",
-        delivery=worker_a_delivery,
+        worker="worker",
+        delivery=worker_delivery,
     )
-    clean_state_b = flow._build_clean_state_artifact(
-        stage_name=stage.name,
-        round_index=round_index,
-        worker="worker_b",
-        delivery=worker_b_delivery,
-    )
-    flow._persist_clean_state_artifact(clean_state_a)
-    flow._persist_clean_state_artifact(clean_state_b)
-    for clean_state in (clean_state_a, clean_state_b):
-        if not clean_state.passed:
-            flow._persist_failure_event(
-                FailureEventArtifact(
-                    stage_name=stage.name,
-                    round_index=round_index,
-                    source=f"{clean_state.worker}_clean_state",
-                    classification=FailureClassification(
-                        code="session_end_clean_state_failed",
-                        category="workspace_state",
-                        disposition="repair_required",
-                        summary="Worker delivery ended without a clean handoff state.",
-                        owner=clean_state.worker,
-                        retryable=True,
-                        evidence=list(clean_state.undocumented_blockers),
-                    ),
-                    details=clean_state.model_dump(),
-                )
+    flow._persist_clean_state_artifact(clean_state)
+    if not clean_state.passed:
+        flow._persist_failure_event(
+            FailureEventArtifact(
+                stage_name=stage.name,
+                round_index=round_index,
+                source="worker_clean_state",
+                classification=FailureClassification(
+                    code="session_end_clean_state_failed",
+                    category="workspace_state",
+                    disposition="repair_required",
+                    summary="Worker delivery ended without a clean handoff state.",
+                    owner="worker",
+                    retryable=True,
+                    evidence=list(clean_state.undocumented_blockers),
+                ),
+                details=clean_state.model_dump(),
             )
-    drift_a = flow._build_plan_drift_artifact(
+        )
+    drift = flow._build_plan_drift_artifact(
         stage_name=stage.name,
         round_index=round_index,
-        worker="worker_a",
-        plan=worker_a_plan,
-        delivery=worker_a_delivery,
+        worker="worker",
+        plan=worker_plan,
+        delivery=worker_delivery,
     )
-    drift_b = flow._build_plan_drift_artifact(
-        stage_name=stage.name,
-        round_index=round_index,
-        worker="worker_b",
-        plan=worker_b_plan,
-        delivery=worker_b_delivery,
-    )
-    flow._persist_plan_drift_artifact(drift_a)
-    flow._persist_plan_drift_artifact(drift_b)
-    for artifact in (drift_a, drift_b):
-        if artifact.severity == "blocking":
-            flow._persist_failure_event(
-                FailureEventArtifact(
-                    stage_name=stage.name,
-                    round_index=round_index,
-                    source=f"{artifact.worker}_plan_drift",
-                    classification=FailureClassification(
-                        code="plan_drift_blocking",
-                        category="planner",
-                        disposition="repair_required",
-                        summary="Implementation drifted outside approved plan scope.",
-                        owner=artifact.worker,
-                        retryable=True,
-                        evidence=artifact.out_of_plan_files or artifact.notes,
-                    ),
-                    details=artifact.model_dump(),
-                )
+    flow._persist_plan_drift_artifact(drift)
+    if drift.severity == "blocking":
+        flow._persist_failure_event(
+            FailureEventArtifact(
+                stage_name=stage.name,
+                round_index=round_index,
+                source="worker_plan_drift",
+                classification=FailureClassification(
+                    code="plan_drift_blocking",
+                    category="planner",
+                    disposition="repair_required",
+                    summary="Implementation drifted outside approved plan scope.",
+                    owner="worker",
+                    retryable=True,
+                    evidence=drift.out_of_plan_files or drift.notes,
+                ),
+                details=drift.model_dump(),
             )
+        )
     for nudge in flow._build_runtime_nudges(
         stage=stage,
         round_index=round_index,
-        drift_a=drift_a,
-        drift_b=drift_b,
+        drift_a=drift,
+        drift_b=None,
     ):
         flow._persist_runtime_nudge(nudge)
 
@@ -1327,9 +1180,11 @@ async def run_round_delivery_phase(
         stage_deadline_monotonic=stage_deadline_monotonic,
     )
     try:
-        auto_checks_a, auto_checks_b = await _run_stage_checks_pair(
+        auto_checks = await _run_stage_checks(
             flow,
+            worker="worker",
             stage=stage,
+            workspace=flow.agents.worker_workspace,
             gate_tier="fast_round",
             round_index=round_index,
             stage_deadline_monotonic=stage_deadline_monotonic,
@@ -1364,11 +1219,10 @@ async def run_round_delivery_phase(
                 current_round=round_index,
                 phase="post_impl_checks",
                 overall_state="blocked",
-                worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+                worker_states={"worker": "blocked"},
                 judge_state="waiting_for_checks",
                 latest_artifacts=[
-                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_delivery.json"),
-                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_delivery.json"),
+                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_delivery.json"),
                 ],
                 notes=[error_message],
             )
@@ -1386,7 +1240,7 @@ async def run_round_delivery_phase(
             current_round=round_index,
             phase="post_impl_checks",
             overall_state="running",
-            worker_states={"worker_a": "self_review", "worker_b": "self_review"},
+            worker_states={"worker": "self_review"},
             judge_state="waiting_for_reviews",
             latest_artifacts=[],
             notes=["Post-implementation checks completed."],
@@ -1397,51 +1251,34 @@ async def run_round_delivery_phase(
             stage=stage,
             status="running",
             current_round=round_index,
-            worker_states={"worker_a": "self_review", "worker_b": "self_review"},
+            worker_states={"worker": "self_review"},
             judge_state="waiting_for_reviews",
             unresolved_actions=[],
             latest_artifacts=[],
         )
     )
-    check_summary_a = format_check_summary(auto_checks_a)
-    check_summary_b = format_check_summary(auto_checks_b)
-    check_artifact_a_post_impl = flow._build_check_summary_artifact(
-        worker="worker_a",
+    check_summary = format_check_summary(auto_checks)
+    check_artifact_post_impl = flow._build_check_summary_artifact(
+        worker="worker",
         stage_name=stage.name,
         round_index=round_index,
         phase="post_impl",
-        checks=auto_checks_a,
-        raw_summary=check_summary_a,
+        checks=auto_checks,
+        raw_summary=check_summary,
     )
-    check_artifact_b_post_impl = flow._build_check_summary_artifact(
-        worker="worker_b",
-        stage_name=stage.name,
-        round_index=round_index,
-        phase="post_impl",
-        checks=auto_checks_b,
-        raw_summary=check_summary_b,
-    )
-    flow._persist_check_summary_artifact(check_artifact_a_post_impl)
-    flow._persist_check_summary_artifact(check_artifact_b_post_impl)
+    flow._persist_check_summary_artifact(check_artifact_post_impl)
 
-    patch_a_after_impl, patch_b_after_impl = await _capture_workspace_artifacts_pair(
+    patch_after_impl = await _capture_workspace_artifacts(
         flow,
-        baseline_a=review_baseline_a,
-        baseline_b=review_baseline_b,
+        baseline=review_baseline,
     )
     return RoundDeliveryPhaseResult(
-        worker_a_delivery=worker_a_delivery,
-        worker_b_delivery=worker_b_delivery,
-        drift_a=drift_a,
-        drift_b=drift_b,
-        check_summary_a=check_summary_a,
-        check_summary_b=check_summary_b,
-        check_artifact_a_post_impl=check_artifact_a_post_impl,
-        check_artifact_b_post_impl=check_artifact_b_post_impl,
-        patch_a_after_impl=patch_a_after_impl,
-        patch_b_after_impl=patch_b_after_impl,
+        worker_delivery=worker_delivery,
+        drift=drift,
+        check_summary=check_summary,
+        check_artifact_post_impl=check_artifact_post_impl,
+        patch_after_impl=patch_after_impl,
     )
-
 
 async def run_round_review_gate_phase(
     flow: object,
@@ -1451,60 +1288,44 @@ async def run_round_review_gate_phase(
     context_packet: StageContextPacket,
     context_packet_json: str,
     review_memory: list,
-    review_baseline_a: WorkspaceArtifactsLike | object,
-    review_baseline_b: WorkspaceArtifactsLike | object,
+    review_baseline: WorkspaceArtifactsLike | object,
     delivery_phase_result: RoundDeliveryPhaseResult,
     no_progress_rounds: int,
     repeated_failure_rounds: int,
     prev_failure_signature: str,
     stage_deadline_monotonic: float,
 ) -> RoundReviewGatePhaseResult:
-    worker_a_self_review, worker_b_self_review = await asyncio.gather(
-        flow._invoke_agent_structured(
-            flow.agents.worker_a,
-            worker_self_review_prompt(
-                "worker_a",
-                stage.name,
-                delivery_phase_result.patch_a_after_impl.review_patch or delivery_phase_result.patch_a_after_impl.patch,
-                auto_check_summary=delivery_phase_result.check_summary_a,
-                context_packet_json=context_packet_json,
-                check_artifact_json=json.dumps(
-                    delivery_phase_result.check_artifact_a_post_impl.model_dump(),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+    # --- Worker self-review ---
+    worker_self_review = await flow._invoke_agent_structured(
+        flow.agents.worker,
+        worker_self_review_prompt(
+            "worker",
+            stage.name,
+            delivery_phase_result.patch_after_impl.review_patch or delivery_phase_result.patch_after_impl.patch,
+            auto_check_summary=delivery_phase_result.check_summary,
+            context_packet_json=context_packet_json,
+            check_artifact_json=json.dumps(
+                delivery_phase_result.check_artifact_post_impl.model_dump(),
+                ensure_ascii=False,
+                indent=2,
             ),
-            SelfReviewResult,
-            stage_name=stage.name,
-            stage_deadline_monotonic=stage_deadline_monotonic,
         ),
-        flow._invoke_agent_structured(
-            flow.agents.worker_b,
-            worker_self_review_prompt(
-                "worker_b",
-                stage.name,
-                delivery_phase_result.patch_b_after_impl.review_patch or delivery_phase_result.patch_b_after_impl.patch,
-                auto_check_summary=delivery_phase_result.check_summary_b,
-                context_packet_json=context_packet_json,
-                check_artifact_json=json.dumps(
-                    delivery_phase_result.check_artifact_b_post_impl.model_dump(),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            ),
-            SelfReviewResult,
-            stage_name=stage.name,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
+        SelfReviewResult,
+        stage_name=stage.name,
+        stage_deadline_monotonic=stage_deadline_monotonic,
     )
 
     flow._remaining_stage_budget_sec(
         stage_name=stage.name,
         stage_deadline_monotonic=stage_deadline_monotonic,
     )
-    auto_checks_a, auto_checks_b = await _run_stage_checks_pair(
+
+    # --- Post self-review checks ---
+    auto_checks = await _run_stage_checks(
         flow,
+        worker="worker",
         stage=stage,
+        workspace=flow.agents.worker_workspace,
         gate_tier="fast_round",
         round_index=round_index,
         stage_deadline_monotonic=stage_deadline_monotonic,
@@ -1513,199 +1334,36 @@ async def run_round_review_gate_phase(
         stage_name=stage.name,
         stage_deadline_monotonic=stage_deadline_monotonic,
     )
-    check_summary_a = format_check_summary(auto_checks_a)
-    check_summary_b = format_check_summary(auto_checks_b)
-    check_artifact_a_post_self = flow._build_check_summary_artifact(
-        worker="worker_a",
+    check_summary = format_check_summary(auto_checks)
+    check_artifact_post_self = flow._build_check_summary_artifact(
+        worker="worker",
         stage_name=stage.name,
         round_index=round_index,
         phase="post_self_review",
-        checks=auto_checks_a,
-        raw_summary=check_summary_a,
+        checks=auto_checks,
+        raw_summary=check_summary,
     )
-    check_artifact_b_post_self = flow._build_check_summary_artifact(
-        worker="worker_b",
-        stage_name=stage.name,
-        round_index=round_index,
-        phase="post_self_review",
-        checks=auto_checks_b,
-        raw_summary=check_summary_b,
-    )
-    flow._persist_check_summary_artifact(check_artifact_a_post_self)
-    flow._persist_check_summary_artifact(check_artifact_b_post_self)
+    flow._persist_check_summary_artifact(check_artifact_post_self)
 
-    patch_a_after_self, patch_b_after_self = await _capture_workspace_artifacts_pair(
+    patch_after_self = await _capture_workspace_artifacts(
         flow,
-        baseline_a=review_baseline_a,
-        baseline_b=review_baseline_b,
+        baseline=review_baseline,
     )
 
-    review_a_on_b, review_b_on_a = await asyncio.gather(
-        flow._invoke_agent_structured(
-            flow.agents.worker_a,
-            worker_peer_review_prompt(
-                "worker_a",
-                "worker_b",
-                stage.name,
-                patch_b_after_self.review_patch or patch_b_after_self.patch,
-                target_auto_check_summary=check_summary_b,
-                context_packet_json=context_packet_json,
-                target_check_artifact_json=json.dumps(
-                    check_artifact_b_post_self.model_dump(),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                seen_report_ids=flow._report_ids_for_stage(stage.name, review_memory),
-                resolved_report_ids=flow._resolved_report_ids_for_stage(stage.name, review_memory),
-            ),
-            PeerReviewResult,
-            stage_name=stage.name,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
-        flow._invoke_agent_structured(
-            flow.agents.worker_b,
-            worker_peer_review_prompt(
-                "worker_b",
-                "worker_a",
-                stage.name,
-                patch_a_after_self.review_patch or patch_a_after_self.patch,
-                target_auto_check_summary=check_summary_a,
-                context_packet_json=context_packet_json,
-                target_check_artifact_json=json.dumps(
-                    check_artifact_a_post_self.model_dump(),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                seen_report_ids=flow._report_ids_for_stage(stage.name, review_memory),
-                resolved_report_ids=flow._resolved_report_ids_for_stage(stage.name, review_memory),
-            ),
-            PeerReviewResult,
-            stage_name=stage.name,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
-    )
-    review_a_on_b = flow._canonicalize_peer_review_result(
-        stage_name=stage.name,
-        round_index=round_index,
-        reviewer="worker_a",
-        target_worker="worker_b",
-        review=review_a_on_b,
-        review_memory=review_memory,
-    )
-    review_b_on_a = flow._canonicalize_peer_review_result(
-        stage_name=stage.name,
-        round_index=round_index,
-        reviewer="worker_b",
-        target_worker="worker_a",
-        review=review_b_on_a,
-        review_memory=review_memory,
-    )
-
-    triage_a, triage_b = await asyncio.gather(
-        flow._invoke_agent_structured(
-            flow.agents.worker_a,
-            owner_triage_prompt(
-                "worker_a",
-                stage.name,
-                json.dumps(review_b_on_a.model_dump(), ensure_ascii=False, indent=2),
-                context_packet_json=context_packet_json,
-                latest_handoff_json=flow._latest_task_handoff_json(stage_name=stage.name, worker="worker_a"),
-            ),
-            OwnerTriageResult,
-            stage_name=stage.name,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
-        flow._invoke_agent_structured(
-            flow.agents.worker_b,
-            owner_triage_prompt(
-                "worker_b",
-                stage.name,
-                json.dumps(review_a_on_b.model_dump(), ensure_ascii=False, indent=2),
-                context_packet_json=context_packet_json,
-                latest_handoff_json=flow._latest_task_handoff_json(stage_name=stage.name, worker="worker_b"),
-            ),
-            OwnerTriageResult,
-            stage_name=stage.name,
-            stage_deadline_monotonic=stage_deadline_monotonic,
-        ),
-    )
-    review_memory = flow._merge_stage_report_memory(
-        stage_name=stage.name,
-        round_index=round_index,
-        review_memory=review_memory,
-        review_a_on_b=review_a_on_b,
-        review_b_on_a=review_b_on_a,
-        triage_a=triage_a,
-        triage_b=triage_b,
-    )
-    flow.state.report_memory[stage.name] = review_memory
-    triage_audit = flow._build_triage_audit_artifact(
-        stage_name=stage.name,
-        round_index=round_index,
-        review_a_on_b=review_a_on_b,
-        review_b_on_a=review_b_on_a,
-        triage_a=triage_a,
-        triage_b=triage_b,
-    )
-    flow._persist_triage_audit_artifact(triage_audit)
-    if not triage_audit.passed:
-        flow._persist_failure_event(
-            FailureEventArtifact(
-                stage_name=stage.name,
-                round_index=round_index,
-                source="triage_audit",
-                classification=FailureClassification(
-                    code="triage_audit_failed",
-                    category="human_decision",
-                    disposition="repair_required",
-                    summary="Owner triage rejected reports without meeting the structured audit policy.",
-                    owner="shared",
-                    retryable=False,
-                    evidence=triage_audit.invalid_rejections + triage_audit.fact_high_severity_rejections,
-                ),
-                details=triage_audit.model_dump(),
-            )
-        )
-
-    flow._remaining_stage_budget_sec(stage_name=stage.name, stage_deadline_monotonic=stage_deadline_monotonic)
-    auto_checks_a, auto_checks_b = await _run_stage_checks_pair(
-        flow,
-        stage=stage,
-        gate_tier="fast_round",
-        round_index=round_index,
-        stage_deadline_monotonic=stage_deadline_monotonic,
-    )
-    flow._remaining_stage_budget_sec(stage_name=stage.name, stage_deadline_monotonic=stage_deadline_monotonic)
-    check_summary_a = format_check_summary(auto_checks_a)
-    check_summary_b = format_check_summary(auto_checks_b)
-    check_artifact_a_post_triage = flow._build_check_summary_artifact(
-        worker="worker_a", stage_name=stage.name, round_index=round_index, phase="post_triage", checks=auto_checks_a, raw_summary=check_summary_a
-    )
-    check_artifact_b_post_triage = flow._build_check_summary_artifact(
-        worker="worker_b", stage_name=stage.name, round_index=round_index, phase="post_triage", checks=auto_checks_b, raw_summary=check_summary_b
-    )
-    flow._persist_check_summary_artifact(check_artifact_a_post_triage)
-    flow._persist_check_summary_artifact(check_artifact_b_post_triage)
-
-    patch_a_final, patch_b_final = await _capture_workspace_artifacts_pair(
-        flow,
-        baseline_a=review_baseline_a,
-        baseline_b=review_baseline_b,
-    )
-
+    # --- Verifier review ---
     verifier_payload = flow._build_verifier_payload(
         stage=stage,
         stage_name=stage.name,
-        patch_a=patch_a_final,
-        patch_b=patch_b_final,
-        review_a_on_b=review_a_on_b,
-        review_b_on_a=review_b_on_a,
-        triage_a=triage_a,
-        triage_b=triage_b,
-        check_artifact_a=check_artifact_a_post_triage,
-        check_artifact_b=check_artifact_b_post_triage,
-        drift_a=delivery_phase_result.drift_a,
-        drift_b=delivery_phase_result.drift_b,
+        patch_a=patch_after_self,
+        patch_b=None,
+        review_a_on_b=None,
+        review_b_on_a=None,
+        triage_a=None,
+        triage_b=None,
+        check_artifact_a=check_artifact_post_self,
+        check_artifact_b=None,
+        drift_a=delivery_phase_result.drift,
+        drift_b=None,
     )
     flow._persist_runtime_status(
         RuntimeStatusSnapshot(
@@ -1714,11 +1372,10 @@ async def run_round_review_gate_phase(
             current_round=round_index,
             phase="verifier_review",
             overall_state="running",
-            worker_states={"worker_a": "triaged", "worker_b": "triaged"},
+            worker_states={"worker": "reviewed"},
             judge_state="waiting_for_verifier",
             latest_artifacts=[
-                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_post_triage_checks.json"),
-                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_post_triage_checks.json"),
+                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_post_self_review_checks.json"),
             ],
             notes=["Verifier is auditing the stage contract and evidence."],
         )
@@ -1728,12 +1385,11 @@ async def run_round_review_gate_phase(
             stage=stage,
             status="running",
             current_round=round_index,
-            worker_states={"worker_a": "triaged", "worker_b": "triaged"},
+            worker_states={"worker": "reviewed"},
             judge_state="waiting_for_verifier",
             unresolved_actions=[],
             latest_artifacts=[
-                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_post_triage_checks.json"),
-                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_post_triage_checks.json"),
+                flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_post_self_review_checks.json"),
             ],
         )
     )
@@ -1779,25 +1435,28 @@ async def run_round_review_gate_phase(
                 details=verifier_report.model_dump(),
             )
         )
-        for worker in ("worker_a", "worker_b"):
-            flow._persist_task_handoff_packet(
-                flow._build_terminal_handoff_packet(
-                    worker=worker,
-                    stage=stage,
+        flow._persist_task_handoff_packet(
+            flow._build_terminal_handoff_packet(
+                worker="worker",
+                stage=stage,
+                round_index=round_index,
+                final_gate=JudgeGateReview(
+                    stage_name=stage.name,
                     round_index=round_index,
-                    final_gate=JudgeGateReview(
-                        stage_name=stage.name,
-                        round_index=round_index,
-                        pass_gate=False,
-                        high_severity_open=[],
-                        disputed_items=[],
-                        required_actions=list(verifier_report.blocking_gaps),
-                        rationale="Verifier fallback timeout recovery handoff.",
-                    ),
-                    trigger="timeout_recovery",
-                )
+                    pass_gate=False,
+                    high_severity_open=[],
+                    disputed_items=[],
+                    required_actions=list(verifier_report.blocking_gaps),
+                    rationale="Verifier fallback timeout recovery handoff.",
+                ),
+                trigger="timeout_recovery",
             )
+        )
     flow._persist_verifier_report(verifier_report)
+
+    final_gate: JudgeGateReview
+    judge_a_gate: JudgeGateReview | None = None
+    judge_b_gate: JudgeGateReview | None = None
 
     if verifier_report.spec_gap_detected:
         spec_gap_report = flow._persist_and_build_spec_gap_report(
@@ -1813,7 +1472,8 @@ async def run_round_review_gate_phase(
             disputed_items=[],
             required_actions=[
                 "Spec gap detected: revise stage contract/source-of-truth before rerunning implementation."
-            ] + [f"Ambiguous contract: {item}" for item in spec_gap_report.ambiguous_contracts] + [f"Clarification needed: {item}" for item in spec_gap_report.requested_clarifications],
+            ] + [f"Ambiguous contract: {item}" for item in spec_gap_report.ambiguous_contracts]
+              + [f"Clarification needed: {item}" for item in spec_gap_report.requested_clarifications],
             rationale="Judge gate was skipped because verifier flagged a spec gap and the harness failed closed.",
         )
         flow._persist_runtime_status(
@@ -1823,7 +1483,7 @@ async def run_round_review_gate_phase(
                 current_round=round_index,
                 phase="spec_gap",
                 overall_state="blocked",
-                worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+                worker_states={"worker": "blocked"},
                 judge_state="skipped_due_to_spec_gap",
                 latest_artifacts=[
                     flow._stage_artifact_ref(stage.name, f"round{round_index}_verifier_report.json"),
@@ -1837,46 +1497,37 @@ async def run_round_review_gate_phase(
                 stage=stage,
                 status="blocked",
                 current_round=round_index,
-                worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+                worker_states={"worker": "blocked"},
                 judge_state="skipped_due_to_spec_gap",
                 unresolved_actions=list(final_gate.required_actions),
                 latest_artifacts=[flow._stage_artifact_ref(stage.name, f"round{round_index}_spec_gap_report.json")],
             )
         )
-        for worker in ("worker_a", "worker_b"):
-            flow._persist_task_handoff_packet(
-                flow._build_terminal_handoff_packet(
-                    worker=worker,
-                    stage=stage,
-                    round_index=round_index,
-                    final_gate=final_gate,
-                    trigger="spec_gap",
-                )
+        flow._persist_task_handoff_packet(
+            flow._build_terminal_handoff_packet(
+                worker="worker",
+                stage=stage,
+                round_index=round_index,
+                final_gate=final_gate,
+                trigger="spec_gap",
             )
-    else:
-        judge_gate_payload = flow._build_judge_gate_payload(
-            stage_name=stage.name,
-            review_a_on_b=review_a_on_b,
-            review_b_on_a=review_b_on_a,
-            triage_a=triage_a,
-            triage_b=triage_b,
-            verifier_report=verifier_report,
         )
+    else:
+        # --- Dual Judge independent review ---
         flow._persist_runtime_status(
             RuntimeStatusSnapshot(
                 target_repo=flow.state.target_repo,
                 current_stage=stage.name,
                 current_round=round_index,
-                phase="judge_gate_review",
+                phase="dual_judge_review",
                 overall_state="running",
-                worker_states={"worker_a": "triaged", "worker_b": "triaged"},
-                judge_state="reviewing",
+                worker_states={"worker": "reviewed"},
+                judge_state="dual_reviewing",
                 latest_artifacts=[
-                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_post_triage_checks.json"),
-                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_post_triage_checks.json"),
+                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_post_self_review_checks.json"),
                     flow._stage_artifact_ref(stage.name, f"round{round_index}_verifier_report.json"),
                 ],
-                notes=["Judge is evaluating final gate input."],
+                notes=["Dual judges are independently reviewing worker output."],
             )
         )
         flow._persist_stage_dashboard_artifact(
@@ -1884,49 +1535,56 @@ async def run_round_review_gate_phase(
                 stage=stage,
                 status="running",
                 current_round=round_index,
-                worker_states={"worker_a": "triaged", "worker_b": "triaged"},
-                judge_state="reviewing",
+                worker_states={"worker": "reviewed"},
+                judge_state="dual_reviewing",
                 unresolved_actions=[],
                 latest_artifacts=[
-                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_post_triage_checks.json"),
-                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_post_triage_checks.json"),
+                    flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_post_self_review_checks.json"),
                     flow._stage_artifact_ref(stage.name, f"round{round_index}_verifier_report.json"),
                 ],
             )
         )
+        worker_patch = patch_after_self.review_patch or patch_after_self.patch
+        verifier_report_json = json.dumps(verifier_report.model_dump(), ensure_ascii=False, indent=2)
+        check_artifact_json = json.dumps(check_artifact_post_self.model_dump(), ensure_ascii=False, indent=2)
+
         try:
-            pre_judge_convergence_signal = flow._build_convergence_signal(
-                stage=stage,
-                stage_name=stage.name,
-                round_index=round_index,
-                patch_a=patch_a_final,
-                patch_b=patch_b_final,
-                check_artifact_a=check_artifact_a_post_triage,
-                check_artifact_b=check_artifact_b_post_triage,
-                prev_failure_signature=prev_failure_signature,
-                no_progress_rounds=no_progress_rounds,
-                repeated_failure_rounds=repeated_failure_rounds,
-            )
-            final_gate = await flow._invoke_agent_structured(
-                flow.agents.judge,
-                judge_gate_review_prompt(
-                    stage_name=stage.name,
-                    round_index=round_index,
-                    judge_packet_json=json.dumps(judge_gate_payload, ensure_ascii=False, indent=2),
-                    auto_check_summary_a=check_summary_a,
-                    auto_check_summary_b=check_summary_b,
-                    context_packet_json=context_packet_json,
-                    check_artifacts_json=json.dumps(
-                        {"worker_a": check_artifact_a_post_triage.model_dump(), "worker_b": check_artifact_b_post_triage.model_dump()},
-                        ensure_ascii=False,
-                        indent=2,
+            judge_a_gate, judge_b_gate = await asyncio.gather(
+                flow._invoke_agent_structured(
+                    flow.agents.judge,
+                    judge_independent_review_prompt(
+                        "judge",
+                        stage.name,
+                        round_index,
+                        worker_patch,
+                        auto_check_summary=check_summary,
+                        context_packet_json=context_packet_json,
+                        check_artifact_json=check_artifact_json,
+                        verifier_report_json=verifier_report_json,
                     ),
-                    convergence_signal_json=json.dumps(pre_judge_convergence_signal.model_dump(), ensure_ascii=False, indent=2),
+                    JudgeGateReview,
+                    stage_name=stage.name,
+                    stage_deadline_monotonic=stage_deadline_monotonic,
                 ),
-                JudgeGateReview,
-                stage_name=stage.name,
-                stage_deadline_monotonic=stage_deadline_monotonic,
+                flow._invoke_agent_structured(
+                    flow.agents.judge_b,
+                    judge_independent_review_prompt(
+                        "judge_b",
+                        stage.name,
+                        round_index,
+                        worker_patch,
+                        auto_check_summary=check_summary,
+                        context_packet_json=context_packet_json,
+                        check_artifact_json=check_artifact_json,
+                        verifier_report_json=verifier_report_json,
+                    ),
+                    JudgeGateReview,
+                    stage_name=stage.name,
+                    stage_deadline_monotonic=stage_deadline_monotonic,
+                ),
             )
+            # Deterministic merge of dual judge decisions
+            final_gate = merge_gate_decisions(judge_a_gate, judge_b_gate, stage.name, round_index)
         except Exception as exc:
             flow._bump_metric("judge_final_gate_fallback_count")
             final_gate = JudgeGateReview(
@@ -1935,8 +1593,8 @@ async def run_round_review_gate_phase(
                 pass_gate=False,
                 high_severity_open=[],
                 disputed_items=[],
-                required_actions=["Judge structured gate failed; rerun this round to get deterministic gate output."],
-                rationale=("Fallback judge gate used due structured invocation failure (fail-closed). " f"Error: {str(exc)[:300]}"),
+                required_actions=["Dual judge structured gate failed; rerun this round to get deterministic gate output."],
+                rationale=f"Fallback judge gate used due to structured invocation failure (fail-closed). Error: {str(exc)[:300]}",
             )
             flow._persist_failure_event(
                 FailureEventArtifact(
@@ -1947,7 +1605,7 @@ async def run_round_review_gate_phase(
                         code="judge_final_gate_fallback",
                         category="structured_output",
                         disposition="retry_next_round",
-                        summary="Judge failed to produce structured final gate output; fail-closed fallback was used.",
+                        summary="Dual judge failed to produce structured final gate output; fail-closed fallback was used.",
                         owner="judge",
                         retryable=True,
                         evidence=[str(exc)[:600]],
@@ -1955,51 +1613,40 @@ async def run_round_review_gate_phase(
                     details={"exception": str(exc)[:1200]},
                 )
             )
-            for worker in ("worker_a", "worker_b"):
-                flow._persist_task_handoff_packet(
-                    flow._build_terminal_handoff_packet(
-                        worker=worker,
-                        stage=stage,
-                        round_index=round_index,
-                        final_gate=final_gate,
-                        trigger="timeout_recovery",
-                    )
+            flow._persist_task_handoff_packet(
+                flow._build_terminal_handoff_packet(
+                    worker="worker",
+                    stage=stage,
+                    round_index=round_index,
+                    final_gate=final_gate,
+                    trigger="timeout_recovery",
                 )
+            )
         final_gate.stage_name = stage.name
         final_gate.round_index = round_index
 
-    all_checks_a_passed = auto_checks_a.all_tests_passed and auto_checks_a.all_lint_passed and auto_checks_a.all_perf_passed and auto_checks_a.all_harness_passed
-    all_checks_b_passed = auto_checks_b.all_tests_passed and auto_checks_b.all_lint_passed and auto_checks_b.all_perf_passed and auto_checks_b.all_harness_passed
-    if not (all_checks_a_passed and all_checks_b_passed):
+    # --- Automated check enforcement ---
+    all_checks_passed = _checks_all_passed(auto_checks)
+    if not all_checks_passed:
         final_gate.pass_gate = False
         if not final_gate.required_actions:
             final_gate.required_actions = []
-        if not all_checks_a_passed:
-            final_gate.required_actions.append("worker_a: automated checks still failing — fix before next round")
-        if not all_checks_b_passed:
-            final_gate.required_actions.append("worker_b: automated checks still failing — fix before next round")
-    if not triage_audit.passed:
-        final_gate.pass_gate = False
-        final_gate.required_actions.extend(
-            ["Owner triage audit failed: rejected findings need evidence-aligned rationale or acceptance."] + triage_audit.unresolved_owner_items
-        )
+        final_gate.required_actions.append("worker: automated checks still failing — fix before next round")
 
+    # --- Convergence signal ---
     convergence_signal = flow._build_convergence_signal(
         stage=stage,
         stage_name=stage.name,
         round_index=round_index,
-        patch_a=patch_a_final,
-        patch_b=patch_b_final,
-        check_artifact_a=check_artifact_a_post_triage,
-        check_artifact_b=check_artifact_b_post_triage,
+        patch_a=patch_after_self,
+        patch_b=None,
+        check_artifact_a=check_artifact_post_self,
+        check_artifact_b=None,
         prev_failure_signature=prev_failure_signature,
         no_progress_rounds=no_progress_rounds,
         repeated_failure_rounds=repeated_failure_rounds,
     )
-    current_failure_signature = flow._combine_failure_signatures(
-        check_artifact_a_post_triage.signal_hash,
-        check_artifact_b_post_triage.signal_hash,
-    )
+    current_failure_signature = check_artifact_post_self.signal_hash or ""
     no_progress_rounds = no_progress_rounds + 1 if convergence_signal.no_progress_detected else 0
     repeated_failure_rounds = repeated_failure_rounds + 1 if convergence_signal.repeated_failure_signature else 0
     prev_failure_signature = current_failure_signature
@@ -2030,73 +1677,48 @@ async def run_round_review_gate_phase(
         stage=stage,
         round_index=round_index,
         convergence_signal=convergence_signal,
-        check_artifact_a=check_artifact_a_post_triage,
-        check_artifact_b=check_artifact_b_post_triage,
+        check_artifact_a=check_artifact_post_self,
+        check_artifact_b=None,
     ):
         flow._persist_runtime_nudge(nudge)
 
+    # --- Handoff ---
     handoff_trigger = "stage_pass" if final_gate.pass_gate else "round_end"
-    handoff_a = flow._build_task_handoff_packet(
-        worker="worker_a",
+    handoff = flow._build_task_handoff_packet(
+        worker="worker",
         trigger=handoff_trigger,
         stage=stage,
         round_index=round_index,
-        delivery=delivery_phase_result.worker_a_delivery,
-        patch=patch_a_final,
-        check_artifact=check_artifact_a_post_triage,
+        delivery=delivery_phase_result.worker_delivery,
+        patch=patch_after_self,
+        check_artifact=check_artifact_post_self,
         context_packet=context_packet,
         judge_feedback=final_gate.required_actions,
         review_memory=review_memory,
     )
-    handoff_b = flow._build_task_handoff_packet(
-        worker="worker_b",
-        trigger=handoff_trigger,
-        stage=stage,
-        round_index=round_index,
-        delivery=delivery_phase_result.worker_b_delivery,
-        patch=patch_b_final,
-        check_artifact=check_artifact_b_post_triage,
-        context_packet=context_packet,
-        judge_feedback=final_gate.required_actions,
-        review_memory=review_memory,
-    )
-    flow._persist_task_handoff_packet(handoff_a)
-    flow._persist_task_handoff_packet(handoff_b)
+    flow._persist_task_handoff_packet(handoff)
 
     round_log = StageRoundLog(
         round_index=round_index,
-        worker_a_delivery=delivery_phase_result.worker_a_delivery,
-        worker_b_delivery=delivery_phase_result.worker_b_delivery,
-        worker_a_auto_checks=auto_checks_a,
-        worker_b_auto_checks=auto_checks_b,
-        worker_a_self_review=worker_a_self_review,
-        worker_b_self_review=worker_b_self_review,
-        peer_review_a_on_b=review_a_on_b,
-        peer_review_b_on_a=review_b_on_a,
-        triage_a=triage_a,
-        triage_b=triage_b,
+        worker_delivery=delivery_phase_result.worker_delivery,
+        worker_auto_checks=auto_checks,
+        worker_self_review=worker_self_review,
+        judge_a_review=judge_a_gate,
+        judge_b_review=judge_b_gate,
         verifier_report=verifier_report,
         judge_gate=final_gate,
     )
 
     return RoundReviewGatePhaseResult(
-        worker_a_self_review=worker_a_self_review,
-        worker_b_self_review=worker_b_self_review,
-        review_a_on_b=review_a_on_b,
-        review_b_on_a=review_b_on_a,
-        triage_a=triage_a,
-        triage_b=triage_b,
-        triage_audit=triage_audit,
+        worker_self_review=worker_self_review,
+        judge_a_gate=judge_a_gate or final_gate,
+        judge_b_gate=judge_b_gate or final_gate,
         verifier_report=verifier_report,
         final_gate=final_gate,
-        auto_checks_a=auto_checks_a,
-        auto_checks_b=auto_checks_b,
-        check_summary_a=check_summary_a,
-        check_summary_b=check_summary_b,
-        check_artifact_a_post_triage=check_artifact_a_post_triage,
-        check_artifact_b_post_triage=check_artifact_b_post_triage,
-        patch_a_final=patch_a_final,
-        patch_b_final=patch_b_final,
+        auto_checks=auto_checks,
+        check_summary=check_summary,
+        check_artifact_post_review=check_artifact_post_self,
+        patch_final=patch_after_self,
         review_memory=review_memory,
         convergence_signal=convergence_signal,
         no_progress_rounds=no_progress_rounds,
@@ -2104,7 +1726,6 @@ async def run_round_review_gate_phase(
         prev_failure_signature=prev_failure_signature,
         round_log=round_log,
     )
-
 
 def _checks_all_passed(checks: object) -> bool:
     return bool(
@@ -2131,16 +1752,12 @@ async def apply_round_outcome(
     round_logs: list[StageRoundLog],
     review_memory: list,
     final_gate: JudgeGateReview,
-    auto_checks_a: object,
-    auto_checks_b: object,
-    check_summary_a: str,
-    check_summary_b: str,
-    review_baseline_a: object,
-    review_baseline_b: object,
+    auto_checks: object,
+    check_summary: str,
+    review_baseline: object,
     stage_deadline_monotonic: float | None = None,
 ) -> RoundPassResult | RoundContinueResult:
-    next_check_summary_a = check_summary_a
-    next_check_summary_b = check_summary_b
+    next_check_summary = check_summary
     declared_pre_promotion = _stage_declares_gate_tier(stage, "pre_promotion")
     declared_full_regression = _stage_declares_gate_tier(stage, "full_regression")
     should_run_pre_promotion_phase = final_gate.pass_gate
@@ -2148,13 +1765,12 @@ async def apply_round_outcome(
     full_regression_artifact_refs: list[str] = []
 
     if should_run_pre_promotion_phase:
-        # Intentional: pre-promotion is always executed as final verification phase.
-        # `declared_pre_promotion` only indicates whether tiered heavy gate commands/contracts
-        # are declared for this stage (used for pass-gate recording/notes).
         try:
-            pre_promotion_checks_a, pre_promotion_checks_b = await _run_stage_checks_pair(
+            pre_promotion_checks = await _run_stage_checks(
                 flow,
+                worker="worker",
                 stage=stage,
+                workspace=flow.agents.worker_workspace,
                 gate_tier="pre_promotion",
                 round_index=round_index,
                 stage_deadline_monotonic=stage_deadline_monotonic,
@@ -2165,11 +1781,8 @@ async def apply_round_outcome(
                 "pre_promotion checks crashed: "
                 f"{type(exc).__name__}: {exc}"
             )
-            next_check_summary_a = pre_promotion_crash
-            next_check_summary_b = pre_promotion_crash
-            final_gate.required_actions.append(
-                pre_promotion_crash
-            )
+            next_check_summary = pre_promotion_crash
+            final_gate.required_actions.append(pre_promotion_crash)
             flow._persist_failure_event(
                 FailureEventArtifact(
                     stage_name=stage.name,
@@ -2192,47 +1805,26 @@ async def apply_round_outcome(
                 )
             )
         else:
-            pre_promotion_summary_a = format_check_summary(pre_promotion_checks_a)
-            pre_promotion_summary_b = format_check_summary(pre_promotion_checks_b)
-            next_check_summary_a = pre_promotion_summary_a
-            next_check_summary_b = pre_promotion_summary_b
-            pre_promotion_artifact_a = flow._build_check_summary_artifact(
-                worker="worker_a",
+            pre_promotion_summary = format_check_summary(pre_promotion_checks)
+            next_check_summary = pre_promotion_summary
+            pre_promotion_artifact = flow._build_check_summary_artifact(
+                worker="worker",
                 stage_name=stage.name,
                 round_index=round_index,
                 phase="pre_promotion",
-                checks=pre_promotion_checks_a,
-                raw_summary=pre_promotion_summary_a,
-            )
-            pre_promotion_artifact_b = flow._build_check_summary_artifact(
-                worker="worker_b",
-                stage_name=stage.name,
-                round_index=round_index,
-                phase="pre_promotion",
-                checks=pre_promotion_checks_b,
-                raw_summary=pre_promotion_summary_b,
+                checks=pre_promotion_checks,
+                raw_summary=pre_promotion_summary,
             )
             pre_promotion_artifact_refs = [
                 flow._stage_artifact_ref(
                     stage.name,
-                    f"round{round_index}_worker_a_pre_promotion_checks.json",
-                ),
-                flow._stage_artifact_ref(
-                    stage.name,
-                    f"round{round_index}_worker_b_pre_promotion_checks.json",
+                    f"round{round_index}_worker_pre_promotion_checks.json",
                 ),
             ]
-            flow._persist_check_summary_artifact(pre_promotion_artifact_a)
-            flow._persist_check_summary_artifact(pre_promotion_artifact_b)
-            if not (
-                _checks_all_passed(pre_promotion_checks_a)
-                and _checks_all_passed(pre_promotion_checks_b)
-            ):
+            flow._persist_check_summary_artifact(pre_promotion_artifact)
+            if not _checks_all_passed(pre_promotion_checks):
                 final_gate.pass_gate = False
-                if not _checks_all_passed(pre_promotion_checks_a):
-                    final_gate.required_actions.append("pre_promotion gate failed for worker_a")
-                if not _checks_all_passed(pre_promotion_checks_b):
-                    final_gate.required_actions.append("pre_promotion gate failed for worker_b")
+                final_gate.required_actions.append("pre_promotion gate failed for worker")
                 flow._persist_failure_event(
                     FailureEventArtifact(
                         stage_name=stage.name,
@@ -2243,22 +1835,12 @@ async def apply_round_outcome(
                             category="remote_gate",
                             disposition="repair_required",
                             summary="Pre-promotion checks failed closed.",
-                            owner="shared",
+                            owner="worker",
                             retryable=False,
-                            evidence=[
-                                flow._stage_artifact_ref(
-                                    stage.name,
-                                    f"round{round_index}_worker_a_pre_promotion_checks.json",
-                                ),
-                                flow._stage_artifact_ref(
-                                    stage.name,
-                                    f"round{round_index}_worker_b_pre_promotion_checks.json",
-                                ),
-                            ],
+                            evidence=pre_promotion_artifact_refs,
                         ),
                         details={
-                            "worker_a_summary": pre_promotion_summary_a,
-                            "worker_b_summary": pre_promotion_summary_b,
+                            "worker_summary": pre_promotion_summary,
                         },
                     )
                 )
@@ -2287,9 +1869,11 @@ async def apply_round_outcome(
 
     if final_gate.pass_gate and declared_full_regression:
         try:
-            full_regression_checks_a, full_regression_checks_b = await _run_stage_checks_pair(
+            full_regression_checks = await _run_stage_checks(
                 flow,
+                worker="worker",
                 stage=stage,
+                workspace=flow.agents.worker_workspace,
                 gate_tier="full_regression",
                 round_index=round_index,
                 stage_deadline_monotonic=stage_deadline_monotonic,
@@ -2300,8 +1884,7 @@ async def apply_round_outcome(
                 "full_regression checks crashed: "
                 f"{type(exc).__name__}: {exc}"
             )
-            next_check_summary_a = full_regression_crash
-            next_check_summary_b = full_regression_crash
+            next_check_summary = full_regression_crash
             final_gate.required_actions.append(full_regression_crash)
             flow._persist_failure_event(
                 FailureEventArtifact(
@@ -2325,47 +1908,26 @@ async def apply_round_outcome(
                 )
             )
         else:
-            full_regression_summary_a = format_check_summary(full_regression_checks_a)
-            full_regression_summary_b = format_check_summary(full_regression_checks_b)
-            next_check_summary_a = full_regression_summary_a
-            next_check_summary_b = full_regression_summary_b
-            full_regression_artifact_a = flow._build_check_summary_artifact(
-                worker="worker_a",
+            full_regression_summary = format_check_summary(full_regression_checks)
+            next_check_summary = full_regression_summary
+            full_regression_artifact = flow._build_check_summary_artifact(
+                worker="worker",
                 stage_name=stage.name,
                 round_index=round_index,
                 phase="full_regression",
-                checks=full_regression_checks_a,
-                raw_summary=full_regression_summary_a,
-            )
-            full_regression_artifact_b = flow._build_check_summary_artifact(
-                worker="worker_b",
-                stage_name=stage.name,
-                round_index=round_index,
-                phase="full_regression",
-                checks=full_regression_checks_b,
-                raw_summary=full_regression_summary_b,
+                checks=full_regression_checks,
+                raw_summary=full_regression_summary,
             )
             full_regression_artifact_refs = [
                 flow._stage_artifact_ref(
                     stage.name,
-                    f"round{round_index}_worker_a_full_regression_checks.json",
-                ),
-                flow._stage_artifact_ref(
-                    stage.name,
-                    f"round{round_index}_worker_b_full_regression_checks.json",
+                    f"round{round_index}_worker_full_regression_checks.json",
                 ),
             ]
-            flow._persist_check_summary_artifact(full_regression_artifact_a)
-            flow._persist_check_summary_artifact(full_regression_artifact_b)
-            if not (
-                _checks_all_passed(full_regression_checks_a)
-                and _checks_all_passed(full_regression_checks_b)
-            ):
+            flow._persist_check_summary_artifact(full_regression_artifact)
+            if not _checks_all_passed(full_regression_checks):
                 final_gate.pass_gate = False
-                if not _checks_all_passed(full_regression_checks_a):
-                    final_gate.required_actions.append("full_regression gate failed for worker_a")
-                if not _checks_all_passed(full_regression_checks_b):
-                    final_gate.required_actions.append("full_regression gate failed for worker_b")
+                final_gate.required_actions.append("full_regression gate failed for worker")
                 flow._persist_failure_event(
                     FailureEventArtifact(
                         stage_name=stage.name,
@@ -2376,22 +1938,12 @@ async def apply_round_outcome(
                             category="remote_gate",
                             disposition="repair_required",
                             summary="Full-regression checks failed closed.",
-                            owner="shared",
+                            owner="worker",
                             retryable=False,
-                            evidence=[
-                                flow._stage_artifact_ref(
-                                    stage.name,
-                                    f"round{round_index}_worker_a_full_regression_checks.json",
-                                ),
-                                flow._stage_artifact_ref(
-                                    stage.name,
-                                    f"round{round_index}_worker_b_full_regression_checks.json",
-                                ),
-                            ],
+                            evidence=full_regression_artifact_refs,
                         ),
                         details={
-                            "worker_a_summary": full_regression_summary_a,
-                            "worker_b_summary": full_regression_summary_b,
+                            "worker_summary": full_regression_summary,
                         },
                     )
                 )
@@ -2424,8 +1976,8 @@ async def apply_round_outcome(
             stage_name=stage.name,
             round_index=round_index,
             final_gate=final_gate,
-            auto_checks_a=auto_checks_a,
-            auto_checks_b=auto_checks_b,
+            auto_checks_a=auto_checks,
+            auto_checks_b=None,
             review_memory=review_memory,
         )
         flow._persist_promotion_readiness_artifact(promotion_readiness)
@@ -2562,11 +2114,10 @@ async def apply_round_outcome(
                     current_round=round_index,
                     phase="stage_passed",
                     overall_state="passed",
-                    worker_states={"worker_a": "done", "worker_b": "done"},
+                    worker_states={"worker": "done"},
                     judge_state="approved",
                     latest_artifacts=[
-                        flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_a_stage_pass_handoff.json"),
-                        flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_b_stage_pass_handoff.json"),
+                        flow._stage_artifact_ref(stage.name, f"round{round_index}_worker_stage_pass_handoff.json"),
                     ],
                     notes=[f"Stage {stage.name} passed and was promoted."],
                 )
@@ -2576,7 +2127,7 @@ async def apply_round_outcome(
                     stage=stage,
                     status="passed",
                     current_round=round_index,
-                    worker_states={"worker_a": "done", "worker_b": "done"},
+                    worker_states={"worker": "done"},
                     judge_state="approved",
                     unresolved_actions=[],
                     latest_artifacts=pass_latest_artifacts,
@@ -2594,8 +2145,6 @@ async def apply_round_outcome(
 
     return RoundContinueResult(
         judge_feedback=final_gate.required_actions,
-        prev_check_summary_a=next_check_summary_a,
-        prev_check_summary_b=next_check_summary_b,
-        review_baseline_a=flow.workspace_port.capture_snapshot(flow.agents.worker_a_workspace),
-        review_baseline_b=flow.workspace_port.capture_snapshot(flow.agents.worker_b_workspace),
+        prev_check_summary=next_check_summary,
+        review_baseline=flow.workspace_port.capture_snapshot(flow.agents.worker_workspace),
     )

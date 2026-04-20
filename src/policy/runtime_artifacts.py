@@ -120,8 +120,7 @@ def run_stage_baseline_sanity(flow: object, *, stage: StageSpec, round_index: in
         )
     ]
     for worker, workspace in (
-        ("worker_a", flow.agents.worker_a_workspace),
-        ("worker_b", flow.agents.worker_b_workspace),
+        ("worker", flow.agents.worker_workspace),
     ):
         failures: list[str] = []
         worker_checks = [f"workspace:{workspace}"]
@@ -398,7 +397,7 @@ def build_promotion_readiness_artifact(
     round_index: int,
     final_gate: Any,
     auto_checks_a: Any,
-    auto_checks_b: Any,
+    auto_checks_b: Any | None,
     review_memory: list[ReportMemoryEntry],
 ) -> PromotionReadinessArtifact:
     all_checks_passed = (
@@ -406,10 +405,6 @@ def build_promotion_readiness_artifact(
         and auto_checks_a.all_lint_passed
         and auto_checks_a.all_perf_passed
         and auto_checks_a.all_harness_passed
-        and auto_checks_b.all_tests_passed
-        and auto_checks_b.all_lint_passed
-        and auto_checks_b.all_perf_passed
-        and auto_checks_b.all_harness_passed
     )
     blocking_report_ids = sorted(
         {
@@ -429,9 +424,9 @@ def build_promotion_readiness_artifact(
     if (
         flow.cfg.promotion_require_all_checks
         and not all_checks_passed
-        and "Automated checks must pass for both workers before promotion." not in unresolved_blockers
+        and "Automated checks must pass before promotion." not in unresolved_blockers
     ):
-        unresolved_blockers.append("Automated checks must pass for both workers before promotion.")
+        unresolved_blockers.append("Automated checks must pass before promotion.")
     if flow.cfg.promotion_require_no_open_fact_high_severity and blocking_report_ids:
         unresolved_blockers.append("Open fact-grade S0/S1 reports remain before promotion.")
     if flow.cfg.promotion_require_no_disputes and final_gate.disputed_items:

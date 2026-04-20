@@ -910,8 +910,7 @@ def _summarize_text(text: str, max_length: int = 60) -> str:
 
 def _actor_label(value: str) -> str:
     return {
-        "worker_a": "Worker A",
-        "worker_b": "Worker B",
+        "worker": "Worker",
         "shared": "当前阶段",
         "judge": "Judge",
         "verifier": "Verifier",
@@ -975,9 +974,9 @@ def _summarize_action(text: str) -> str:
     lowered = text.lower()
     if lowered.startswith("fix all compile/runtime blockers"):
         return "先修复编译/运行阻断，恢复核心远端命令通过"
-    if lowered.startswith("for worker_b, refactor core module cleanup/control flow"):
+    if lowered.startswith("for worker, refactor core module cleanup/control flow"):
         return "Worker B 需要修复核心模块的清理/控制流问题"
-    if lowered.startswith("for worker_a, resolve exported symbol/api regression"):
+    if lowered.startswith("for worker, resolve exported symbol/api regression"):
         return "Worker A 需要修复导出符号/API 回归"
     if "type-visibility regression in include headers" in lowered:
         return "需要确认 include 头文件的类型可见性回归已修复"
@@ -986,10 +985,9 @@ def _summarize_action(text: str) -> str:
     if lowered.startswith("re-run full post-triage harness"):
         return "重新执行完整 post-triage 验证并附带干净证据"
     if "automated checks still failing" in lowered:
-        if lowered.startswith("worker_a:"):
+        if lowered.startswith("worker:"):
             return "Worker A 自动检查仍失败，需要继续修复"
-        if lowered.startswith("worker_b:"):
-            return "Worker B 自动检查仍失败，需要继续修复"
+        pass  # legacy worker_b compat removed
         return "自动检查仍失败，需要先修复后再推进"
     if "exhausted automatic recovery budget" in lowered:
         return "远端超时恢复预算耗尽，已进入阻断态，需要人工处理远端进程/环境"
@@ -1135,7 +1133,7 @@ def _build_worker_details(
     plan_overview = current_stage.get("latest_plan_overview") or {}
     worker_states = current_stage.get("worker_states") or {}
     details: dict[str, dict[str, Any]] = {}
-    for worker_key in ("worker_a", "worker_b"):
+    for worker_key in ("worker",):
         state = str(worker_states.get(worker_key, "idle"))
         details[worker_key] = {
             "state": state,
@@ -1573,8 +1571,7 @@ def build_monitor_view(payload: dict[str, Any]) -> dict[str, Any]:
                 "highlight": _stage_highlight(stage),
                 "passed_gates": stage_passed_gates,
                 "worker_states": {
-                    "worker_a": str(stage_worker_states.get("worker_a", "idle")),
-                    "worker_b": str(stage_worker_states.get("worker_b", "idle")),
+                    "worker": str(stage_worker_states.get("worker", "idle")),
                 },
                 "judge_state": stage_judge_state or "not_started",
             }
@@ -1651,15 +1648,10 @@ def build_monitor_view(payload: dict[str, Any]) -> dict[str, Any]:
             "stage_total": len(roadmap),
         },
         "agents": {
-            "worker_a": {
-                "state": str(current_worker_states.get("worker_a", "idle")),
-                "label": _WORKER_LABEL.get(str(current_worker_states.get("worker_a", "idle")), ""),
-                "progress": _WORKER_PROGRESS.get(str(current_worker_states.get("worker_a", "idle")), 10),
-            },
-            "worker_b": {
-                "state": str(current_worker_states.get("worker_b", "idle")),
-                "label": _WORKER_LABEL.get(str(current_worker_states.get("worker_b", "idle")), ""),
-                "progress": _WORKER_PROGRESS.get(str(current_worker_states.get("worker_b", "idle")), 10),
+            "worker": {
+                "state": str(current_worker_states.get("worker", "idle")),
+                "label": _WORKER_LABEL.get(str(current_worker_states.get("worker", "idle")), ""),
+                "progress": _WORKER_PROGRESS.get(str(current_worker_states.get("worker", "idle")), 10),
             },
             "judge": {
                 "state": judge_state or "not_started",
@@ -2160,14 +2152,14 @@ def render_monitor_html(
       const raw = String(text || "");
       const lowered = raw.toLowerCase();
       if (lowered.startsWith("fix all compile/runtime blockers")) return "先修复编译/运行阻断，恢复核心远端命令通过";
-      if (lowered.startsWith("for worker_b, refactor core module cleanup/control flow")) return "Worker B 需要修复核心模块的清理/控制流问题";
-      if (lowered.startsWith("for worker_a, resolve exported symbol/api regression")) return "Worker A 需要修复导出符号/API 回归";
+      if (lowered.startsWith("for worker, refactor core module cleanup/control flow")) return "Worker 需要修复核心模块的清理/控制流问题";
+      if (lowered.startsWith("for worker, resolve exported symbol/api regression")) return "Worker 需要修复导出符号/API 回归";
       if (lowered.includes("type-visibility regression in include headers")) return "需要确认 include 头文件的类型可见性回归已修复";
       if (lowered.startsWith("produce and validate `docs/p2_window_report.json`")) return "补齐并验证 `docs/p2_window_report.json` 证据产物";
       if (lowered.startsWith("re-run full post-triage harness")) return "重新执行完整 post-triage 验证并附带干净证据";
       if (lowered.includes("automated checks still failing")) {{
-        if (lowered.startsWith("worker_a:")) return "Worker A 自动检查仍失败，需要继续修复";
-        if (lowered.startsWith("worker_b:")) return "Worker B 自动检查仍失败，需要继续修复";
+        if (lowered.startsWith("worker:")) return "Worker 自动检查仍失败，需要继续修复";
+
         return "自动检查仍失败，需要先修复后再推进";
       }}
       return raw;
@@ -2181,7 +2173,7 @@ def render_monitor_html(
       if (parts.length === 4) {{
         const actor = parts[0];
         const category = parts[1];
-        const actorLabel = actor === "worker_a" ? "Worker A" : actor === "worker_b" ? "Worker B" : "当前阶段";
+        const actorLabel = actor === "worker" ? "Worker" : "当前阶段";
         if (category === "todo_enforcement") return {{summary: `${{actorLabel}} 偏离已批准方案，需要先回到既定修复范围`, detail: raw}};
         if (category === "artifact_missing") return {{summary: "需要补齐证据产物并满足产物契约后再申请通过", detail: raw}};
         if (category === "no_progress") return {{summary: "本轮没有新的有效改动，需要收敛阻塞点或切换修复策略", detail: raw}};
@@ -2690,8 +2682,7 @@ def render_monitor_html(
       const agents = view.agents || {{}};
       const agentRow = document.getElementById("agent-row");
       const agentConfigs = [
-        {{key:"worker_a", name:"Worker A（实现者 A）", data: agents.worker_a}},
-        {{key:"worker_b", name:"Worker B（实现者 B）", data: agents.worker_b}},
+        {{key:"worker", name:"Worker（实现者）", data: agents.worker}},
         {{key:"judge", name:"Judge / Verifier（裁判 / 验证者）", data: agents.judge}},
       ];
       agentRow.innerHTML = agentConfigs.map(ac => {{
@@ -2788,8 +2779,7 @@ def render_monitor_html(
       const wd = view.worker_details || {{}};
       const compareGrid = document.getElementById("compare-grid");
       const workerConfigs = [
-        {{key:"worker_a", name:"Worker A（实现者 A）"}},
-        {{key:"worker_b", name:"Worker B（实现者 B）"}},
+        {{key:"worker", name:"Worker（实现者）"}},
       ];
       compareGrid.innerHTML = workerConfigs.map(wc => {{
         const w = wd[wc.key] || {{}};

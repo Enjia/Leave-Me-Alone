@@ -55,26 +55,21 @@ def compact_round_log(log: StageRoundLog) -> CompactStageRoundLog:
     all_report_ids: set[str] = set()
     closed_ids: set[str] = set()
 
-    for review in (log.peer_review_a_on_b, log.peer_review_b_on_a):
-        for report in review.reports:
-            report_id = getattr(report, "report_id", "")
+    # In single-worker + dual-judge architecture, review reports come from
+    # judge_a_review and judge_b_review gate decisions rather than peer reviews.
+    for judge_review in (log.judge_a_review, log.judge_b_review):
+        if judge_review is None:
+            continue
+        for item in getattr(judge_review, "high_severity_open", []):
+            report_id = item if isinstance(item, str) else getattr(item, "report_id", "")
             if report_id:
                 all_report_ids.add(report_id)
-
-    for triage in (log.triage_a, log.triage_b):
-        for decision in getattr(triage, "decisions", []):
-            action = getattr(decision, "action", "")
-            if action in ("accept_fix", "reject"):
-                report_id = getattr(decision, "report_id", "")
-                if report_id:
-                    closed_ids.add(report_id)
 
     open_ids = all_report_ids - closed_ids
 
     return CompactStageRoundLog(
         round_index=log.round_index,
-        worker_a_summary=_truncate(log.worker_a_delivery.summary, 200),
-        worker_b_summary=_truncate(log.worker_b_delivery.summary, 200),
+        worker_summary=_truncate(log.worker_delivery.summary, 200),
         gate_decision="pass" if log.judge_gate.pass_gate else "fail",
         gate_reasoning=_truncate(log.judge_gate.rationale, 300),
         open_report_ids=sorted(open_ids),

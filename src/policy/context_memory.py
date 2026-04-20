@@ -53,20 +53,11 @@ def build_context_synthesis(
         max_current_chars=current_check_limit,
         max_history_chars=history_check_limit,
     )
-    compressed_check_b = compress_check_summary_by_round(
-        prev_check_summary_b,
-        is_current_round=is_current,
-        max_current_chars=current_check_limit,
-        max_history_chars=history_check_limit,
-    )
-
     # --- Build confirmed_facts with fixed-zone truncation ---
     truncate_limit = max(300, fixed_budget // 4)
     confirmed_facts = [f"judge_required_action:{item}" for item in judge_feedback]
     if compressed_check_a:
-        confirmed_facts.append("worker_a_previous_checks:" + flow._truncate_text(compressed_check_a, truncate_limit))
-    if compressed_check_b:
-        confirmed_facts.append("worker_b_previous_checks:" + flow._truncate_text(compressed_check_b, truncate_limit))
+        confirmed_facts.append("worker_previous_checks:" + flow._truncate_text(compressed_check_a, truncate_limit))
 
     active_inferences: list[str] = []
     verification_backlog: list[str] = []
@@ -219,6 +210,9 @@ def stable_report_id(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+# DEPRECATED in single-worker mode: canonicalize_peer_review_result is no longer
+# called.  Peer review was removed in the single-worker + dual-judge architecture.
+# Kept for reference only; do not call.
 def canonicalize_peer_review_result(
     flow: object,
     *,
@@ -262,47 +256,20 @@ def canonicalize_peer_review_result(
         overall_notes=review.overall_notes,
     )
 
-
 def merge_stage_report_memory(
     *,
     round_index: int,
     review_memory: list[ReportMemoryEntry],
-    review_a_on_b: PeerReviewResult,
-    review_b_on_a: PeerReviewResult,
-    triage_a: object,
-    triage_b: object,
 ) -> list[ReportMemoryEntry]:
-    memory_by_id = {entry.report_id: entry for entry in review_memory}
-    decisions_by_report_id = {
-        decision.report_id: decision.action
-        for decision in triage_a.decisions + triage_b.decisions
-    }
-    for review in (review_a_on_b, review_b_on_a):
-        for report in review.reports:
-            status = "open"
-            action = decisions_by_report_id.get(report.report_id)
-            if action == "accept_fix":
-                status = "resolved"
-            elif action == "reject":
-                status = "deferred" if report.evidence_semantics.certainty == "to_verify" else "rejected"
-            existing = memory_by_id.get(report.report_id)
-            if existing is None:
-                memory_by_id[report.report_id] = ReportMemoryEntry(
-                    report_id=report.report_id,
-                    reviewer=review.reviewer,
-                    target_worker=review.target_worker,
-                    severity=report.severity,
-                    certainty=report.evidence_semantics.certainty,
-                    title=report.title,
-                    file_path=report.file_path,
-                    line=report.line,
-                    status=status,
-                    first_round=round_index,
-                    last_round=round_index,
-                )
-                continue
-            existing.severity = report.severity
-            existing.certainty = report.evidence_semantics.certainty
-            existing.status = status
-            existing.last_round = round_index
-    return sorted(memory_by_id.values(), key=lambda item: item.report_id)
+    """Merge report memory for single-worker + dual-judge architecture.
+
+    In this architecture there are no peer reviews or owner triage decisions.
+    The report memory is carried forward as-is, with ``last_round`` updated to
+    the current round for all open entries so the memory stays fresh.
+    """
+    updated: list[ReportMemoryEntry] = []
+    for entry in review_memory:
+        if entry.status == "open":
+            entry.last_round = round_index
+        updated.append(entry)
+    return sorted(updated, key=lambda item: item.report_id)

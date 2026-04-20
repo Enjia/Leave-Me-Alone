@@ -58,7 +58,6 @@ from persistence.service import PersistenceService
 from policy.context_memory import (
     build_context_synthesis,
     build_stage_context_packet,
-    canonicalize_peer_review_result,
     merge_stage_report_memory,
     report_ids_for_stage,
     resolved_report_ids_for_stage,
@@ -286,8 +285,7 @@ class MultiCodexReviewFlow(FlowHarnessFacadeMixin, Flow[ReviewFlowState]):
         stage: StageSpec,
         round_index: int,
         context_packet_json: str,
-        worker_a_plan: WorkerPlan,
-        worker_b_plan: WorkerPlan,
+        worker_plan: WorkerPlan,
         stage_deadline_monotonic: float,
     ) -> PlanGateReview:
         return await invoke_plan_gate_review(
@@ -295,8 +293,7 @@ class MultiCodexReviewFlow(FlowHarnessFacadeMixin, Flow[ReviewFlowState]):
             stage=stage,
             round_index=round_index,
             context_packet_json=context_packet_json,
-            worker_a_plan=worker_a_plan,
-            worker_b_plan=worker_b_plan,
+            worker_plan=worker_plan,
             stage_deadline_monotonic=stage_deadline_monotonic,
         )
 
@@ -422,26 +419,6 @@ class MultiCodexReviewFlow(FlowHarnessFacadeMixin, Flow[ReviewFlowState]):
         del stage_name
         return resolved_report_ids_for_stage(review_memory)
 
-    def _canonicalize_peer_review_result(
-        self,
-        *,
-        stage_name: str,
-        round_index: int,
-        reviewer: str,
-        target_worker: str,
-        review: PeerReviewResult,
-        review_memory: list[ReportMemoryEntry],
-    ) -> PeerReviewResult:
-        return canonicalize_peer_review_result(
-            self,
-            stage_name=stage_name,
-            round_index=round_index,
-            reviewer=reviewer,
-            target_worker=target_worker,
-            review=review,
-            review_memory=review_memory,
-        )
-
     @staticmethod
     def _stable_report_id(
         *,
@@ -465,19 +442,11 @@ class MultiCodexReviewFlow(FlowHarnessFacadeMixin, Flow[ReviewFlowState]):
         stage_name: str,
         round_index: int,
         review_memory: list[ReportMemoryEntry],
-        review_a_on_b: PeerReviewResult,
-        review_b_on_a: PeerReviewResult,
-        triage_a: OwnerTriageResult,
-        triage_b: OwnerTriageResult,
     ) -> list[ReportMemoryEntry]:
         del stage_name
         return merge_stage_report_memory(
             round_index=round_index,
             review_memory=review_memory,
-            review_a_on_b=review_a_on_b,
-            review_b_on_a=review_b_on_a,
-            triage_a=triage_a,
-            triage_b=triage_b,
         )
 
     async def _invoke_agent_structured(

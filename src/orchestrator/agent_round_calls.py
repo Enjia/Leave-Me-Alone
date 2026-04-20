@@ -158,8 +158,7 @@ async def invoke_plan_gate_review(
     stage: StageSpec,
     round_index: int,
     context_packet_json: str,
-    worker_a_plan: WorkerPlan,
-    worker_b_plan: WorkerPlan,
+    worker_plan: WorkerPlan,
     stage_deadline_monotonic: float,
 ) -> PlanGateReview:
     review = await flow._invoke_agent_structured(
@@ -167,8 +166,7 @@ async def invoke_plan_gate_review(
         judge_plan_gate_prompt(
             stage,
             round_index,
-            json.dumps(worker_a_plan.model_dump(), ensure_ascii=False, indent=2),
-            json.dumps(worker_b_plan.model_dump(), ensure_ascii=False, indent=2),
+            json.dumps(worker_plan.model_dump(), ensure_ascii=False, indent=2),
             context_packet_json=context_packet_json,
         ),
         PlanGateReview,
@@ -179,8 +177,7 @@ async def invoke_plan_gate_review(
         update={
             "stage_name": stage.name,
             "round_index": round_index,
-            "worker_a_required_actions": [item.strip() for item in review.worker_a_required_actions if item.strip()],
-            "worker_b_required_actions": [item.strip() for item in review.worker_b_required_actions if item.strip()],
+            "worker_required_actions": [item.strip() for item in review.worker_required_actions if item.strip()],
             "blockers": [item.strip() for item in review.blockers if item.strip()],
             "rationale": review.rationale.strip(),
         }

@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 from core.models import BudgetEnforcement, RunBudgetMode, StageArtifact, StageSpec
 
 Provider = Literal["codex"]
-OwnerWorker = Literal["worker_a", "worker_b"]
+OwnerWorker = Literal["worker"]
 CURRENT_STAGE_ARTIFACT_SCHEMA_VERSION = 1
 
 
@@ -37,7 +37,7 @@ class RuntimeConfig:
     remote_workdir_secondary: str = ""
     split_worker_remote_endpoints: bool = False
     auto_approve_decisions: list[str] = field(default_factory=list)
-    owner_worker: OwnerWorker = "worker_a"
+    owner_worker: OwnerWorker = "worker"
     enable_convergence_signals: bool = True
     max_no_progress_rounds: int = 2
     max_repeated_failure_rounds: int = 2

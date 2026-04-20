@@ -478,16 +478,14 @@ Return ONLY valid JSON matching model: StageGate
 def judge_plan_gate_prompt(
     stage: StageSpec,
     round_index: int,
-    worker_a_plan_json: str,
-    worker_b_plan_json: str,
+    worker_plan_json: str,
     context_packet_json: str = "",
 ) -> str:
     source_requirements = _extract_stage_source_requirements(stage)
     payload: dict[str, object] = {
         "stage_contract": _build_stage_contract_packet(stage),
         "round_index": round_index,
-        "worker_a_plan": json.loads(worker_a_plan_json),
-        "worker_b_plan": json.loads(worker_b_plan_json),
+        "worker_plan": json.loads(worker_plan_json),
     }
     if context_packet_json:
         try:
@@ -496,7 +494,7 @@ def judge_plan_gate_prompt(
             payload["context_packet_raw"] = trim_patch(context_packet_json, max_chars=8_000)
     payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
     return f"""
-You are the JUDGE agent. Review worker plans before implementation starts.
+You are the JUDGE agent. Review the worker plan before implementation starts.
 
 Stage: {stage.name}
 Objective: {stage.objective}
@@ -513,8 +511,8 @@ Approval policy:
 - Reject plans that widen scope beyond declared write scope / non-goals.
 - Reject plans that ignore hard invariants or acceptance criteria.
 - Prefer narrow, file-tied, verifiable plans.
-- If only one worker plan is bad, return targeted required actions for that worker instead of generic prose.
-- `pass_gate=true` only when both worker plans are concrete enough to proceed.
+- If the plan is deficient, return targeted required actions in `worker_required_actions`.
+- `pass_gate=true` only when the worker plan is concrete enough to proceed.
 
 Return ONLY valid JSON matching model: PlanGateReview
 """.strip()
@@ -877,6 +875,8 @@ Return ONLY valid JSON matching model: SelfReviewResult
 """.strip()
 
 
+# DEPRECATED in single-worker mode: peer review was removed in the
+# single-worker + dual-judge architecture.  Kept for reference only.
 def worker_peer_review_prompt(
     reviewer: str,
     target_worker: str,
@@ -943,6 +943,8 @@ Return ONLY valid JSON matching model: PeerReviewResult
 """.strip()
 
 
+# DEPRECATED in single-worker mode: owner triage was removed in the
+# single-worker + dual-judge architecture.  Kept for reference only.
 def owner_triage_prompt(
     owner: str,
     stage_name: str,
@@ -1014,12 +1016,70 @@ Return ONLY valid JSON matching model: VerifierReport
 """.strip()
 
 
+def judge_independent_review_prompt(
+    judge_role: str,
+    stage_name: str,
+    round_index: int,
+    worker_patch: str,
+    auto_check_summary: str = "",
+    context_packet_json: str = "",
+    check_artifact_json: str = "",
+    verifier_report_json: str = "",
+) -> str:
+    context_section = f"\nContext packet:\n{context_packet_json}\n" if context_packet_json else ""
+    check_artifact_section = (
+        f"\nStructured check artifact:\n{check_artifact_json}\n"
+        if check_artifact_json else ""
+    )
+    verifier_section = (
+        f"\nVerifier report:\n{verifier_report_json}\n"
+        if verifier_report_json else ""
+    )
+    check_section = ""
+    if auto_check_summary:
+        check_section = f"""
+Automated check results (objective, non-negotiable):
+{auto_check_summary}
+
+IMPORTANT: If automated checks fail, the stage CANNOT pass regardless of
+subjective review outcomes. Automated check failures are S0/S1 by definition.
+"""
+    return f"""
+You are {judge_role}. Perform an INDEPENDENT code review and gate decision.
+
+Stage: {stage_name}
+Round: {round_index}
+
+{SEVERITY_POLICY}
+
+{BUG_REPORT_TEMPLATE}
+{context_section}
+{check_artifact_section}
+{verifier_section}
+
+Worker patch:
+{trim_patch(worker_patch)}
+{check_section}
+Review rules:
+1. Review the worker's code changes thoroughly and independently.
+2. Report ALL potential defects with evidence using the BugReport schema.
+3. Evaluate verifier blocking gaps, high-severity (S0/S1) items, and automated checks.
+4. Automated check failures are non-negotiable blockers.
+5. Set pass_gate=true ONLY if:
+   - All automated checks pass
+   - Verifier says pass_ready=true
+   - No open fact-grade S0/S1 issues remain
+6. If pass_gate=false, provide concrete required_actions for the next round.
+7. Be strict, thorough, and evidence-based.
+
+Return ONLY valid JSON matching model: JudgeGateReview
+""".strip()
+
 def judge_gate_review_prompt(
     stage_name: str,
     round_index: int,
     judge_packet_json: str,
-    auto_check_summary_a: str = "",
-    auto_check_summary_b: str = "",
+    auto_check_summary: str = "",
     context_packet_json: str = "",
     check_artifacts_json: str = "",
     convergence_signal_json: str = "",
@@ -1034,15 +1094,10 @@ def judge_gate_review_prompt(
         if convergence_signal_json else ""
     )
     check_section = ""
-    if auto_check_summary_a or auto_check_summary_b:
+    if auto_check_summary:
         check_section = f"""
 Automated check results (objective, non-negotiable):
-
-Worker A:
-{auto_check_summary_a or '(no checks configured)'}
-
-Worker B:
-{auto_check_summary_b or '(no checks configured)'}
+{auto_check_summary}
 
 IMPORTANT: If automated checks fail, the stage CANNOT pass regardless of
 subjective review outcomes. Automated check failures are S0/S1 by definition.
@@ -1062,20 +1117,17 @@ Input (high-severity + disputed items only):
 {judge_packet_json}
 {check_section}
 Gate review rules:
-1. Review verifier blocking gaps, high-severity (S0/S1) items, disputed items, and automated checks.
-2. For disputed items: examine both the original report and the owner's
-   rejection rationale. Make a final ruling.
-3. Treat verifier as the authoritative gap auditor. Do NOT redo full criterion-by-criterion verification from scratch.
-4. Automated check failures are non-negotiable blockers.
-5. Set pass_gate=true ONLY if:
-   - All automated checks pass for both workers
+1. Review verifier blocking gaps, high-severity (S0/S1) items, and automated checks.
+2. Treat verifier as the authoritative gap auditor. Do NOT redo full criterion-by-criterion verification from scratch.
+3. Automated check failures are non-negotiable blockers.
+4. Set pass_gate=true ONLY if:
+   - All automated checks pass
    - Verifier says pass_ready=true
    - No open fact-grade S0/S1 issues remain
-   - All disputes are resolved
-6. inference/to_verify findings should request more evidence or checklist follow-up,
+5. inference/to_verify findings should request more evidence or checklist follow-up,
    not block by themselves unless automated checks or direct code facts prove them.
-7. If pass_gate=false, provide concrete required_actions for the next round.
-8. Be concise but specific in rationale.
+6. If pass_gate=false, provide concrete required_actions for the next round.
+7. Be concise but specific in rationale.
 
 Return ONLY valid JSON matching model: JudgeGateReview
 """.strip()

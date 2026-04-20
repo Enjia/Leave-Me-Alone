@@ -108,7 +108,7 @@ async def initialize_stage(flow: object, stage: StageSpec) -> StageBootstrap:
             current_round=0,
             phase="stage_start",
             overall_state="running",
-            worker_states={"worker_a": "idle", "worker_b": "idle"},
+            worker_states={"worker": "idle"},
             judge_state="planning_stage_gate",
             latest_artifacts=[flow._stage_artifact_ref(stage.name, "stage_spec_snapshot.json")],
             notes=[f"Starting stage {stage.name}."],
@@ -119,7 +119,7 @@ async def initialize_stage(flow: object, stage: StageSpec) -> StageBootstrap:
             stage=stage,
             status="running",
             current_round=0,
-            worker_states={"worker_a": "idle", "worker_b": "idle"},
+            worker_states={"worker": "idle"},
             judge_state="planning_stage_gate",
             unresolved_actions=[],
             latest_artifacts=[flow._stage_artifact_ref(stage.name, "stage_spec_snapshot.json")],
@@ -317,21 +317,13 @@ async def prepare_stage_gate(
 
 
 async def run_remote_preflight(flow: object, stage: StageSpec) -> StageResult | None:
-    preflight_a, preflight_b = await asyncio.gather(
-        flow.check_runner.run_remote_preflight("worker_a", stage, flow.agents.worker_a_workspace),
-        flow.check_runner.run_remote_preflight("worker_b", stage, flow.agents.worker_b_workspace),
-    )
+    preflight_results = await flow.check_runner.run_remote_preflight("worker", stage, flow.agents.worker_workspace)
     preflight_artifacts = [
-        flow._persist_remote_preflight_results(stage, "worker_a", preflight_a),
-        flow._persist_remote_preflight_results(stage, "worker_b", preflight_b),
+        flow._persist_remote_preflight_results(stage, "worker", preflight_results),
     ]
     preflight_failures = [
-        ("worker_a", result)
-        for result in preflight_a
-        if not result.passed
-    ] + [
-        ("worker_b", result)
-        for result in preflight_b
+        ("worker", result)
+        for result in preflight_results
         if not result.passed
     ]
     if not preflight_failures:
@@ -362,8 +354,7 @@ async def run_remote_preflight(flow: object, stage: StageSpec) -> StageResult | 
                 evidence=evidence,
             ),
             details={
-                "worker_a": [item.model_dump() for item in preflight_a],
-                "worker_b": [item.model_dump() for item in preflight_b],
+                "worker": [item.model_dump() for item in preflight_results],
             },
         )
     )
@@ -381,15 +372,7 @@ async def run_remote_preflight(flow: object, stage: StageSpec) -> StageResult | 
     )
     flow._persist_task_handoff_packet(
         flow._build_terminal_handoff_packet(
-            worker="worker_a",
-            stage=stage,
-            round_index=0,
-            final_gate=final_gate,
-        )
-    )
-    flow._persist_task_handoff_packet(
-        flow._build_terminal_handoff_packet(
-            worker="worker_b",
+            worker="worker",
             stage=stage,
             round_index=0,
             final_gate=final_gate,
@@ -402,7 +385,7 @@ async def run_remote_preflight(flow: object, stage: StageSpec) -> StageResult | 
             current_round=0,
             phase="remote_preflight_failed",
             overall_state="blocked",
-            worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+            worker_states={"worker": "blocked"},
             judge_state="not_started",
             latest_artifacts=preflight_artifacts,
             notes=required_actions,
@@ -413,7 +396,7 @@ async def run_remote_preflight(flow: object, stage: StageSpec) -> StageResult | 
             stage=stage,
             status="blocked",
             current_round=0,
-            worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+            worker_states={"worker": "blocked"},
             judge_state="not_started",
             unresolved_actions=required_actions,
             latest_artifacts=preflight_artifacts,
@@ -436,15 +419,14 @@ def finalize_failed_stage(
     final_gate: JudgeGateReview,
     round_logs: list,
 ) -> StageResult:
-    for worker in ("worker_a", "worker_b"):
-        flow._persist_task_handoff_packet(
-            flow._build_terminal_handoff_packet(
-                worker=worker,
-                stage=stage,
-                round_index=max_round,
-                final_gate=final_gate,
-            )
+    flow._persist_task_handoff_packet(
+        flow._build_terminal_handoff_packet(
+            worker="worker",
+            stage=stage,
+            round_index=max_round,
+            final_gate=final_gate,
         )
+    )
     flow._persist_runtime_status(
         RuntimeStatusSnapshot(
             target_repo=flow.state.target_repo,
@@ -452,11 +434,10 @@ def finalize_failed_stage(
             current_round=max_round,
             phase="stage_failed",
             overall_state="failed",
-            worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+            worker_states={"worker": "blocked"},
             judge_state="rejected",
             latest_artifacts=[
-                flow._stage_artifact_ref(stage.name, f"round{max_round}_worker_a_stage_fail_handoff.json"),
-                flow._stage_artifact_ref(stage.name, f"round{max_round}_worker_b_stage_fail_handoff.json"),
+                flow._stage_artifact_ref(stage.name, f"round{max_round}_worker_stage_fail_handoff.json"),
             ],
             notes=list(final_gate.required_actions),
         )
@@ -467,8 +448,7 @@ def finalize_failed_stage(
         status="failed",
         passed_gates=["stage_initialized", "remote_preflight", "stage_gate"],
         latest_artifacts=[
-            flow._stage_artifact_ref(stage.name, f"round{max_round}_worker_a_stage_fail_handoff.json"),
-            flow._stage_artifact_ref(stage.name, f"round{max_round}_worker_b_stage_fail_handoff.json"),
+            flow._stage_artifact_ref(stage.name, f"round{max_round}_worker_stage_fail_handoff.json"),
         ],
         current_blocker=(final_gate.required_actions[0] if final_gate.required_actions else ""),
         current_blocker_category="judge_gate",
@@ -487,7 +467,7 @@ def finalize_failed_stage(
             stage=stage,
             status="failed",
             current_round=max_round,
-            worker_states={"worker_a": "blocked", "worker_b": "blocked"},
+            worker_states={"worker": "blocked"},
             judge_state="rejected",
             unresolved_actions=list(final_gate.required_actions),
             latest_artifacts=[flow._stage_artifact_ref(stage.name, f"round{max_round}_convergence_signal.json")],

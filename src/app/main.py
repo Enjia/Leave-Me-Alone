@@ -83,7 +83,7 @@ def build_run_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "JSON object for role->base_url map, "
-            "e.g. '{\"judge\":\"http://127.0.0.1:9100\",\"worker_a\":\"http://127.0.0.1:9101\",\"worker_b\":\"http://127.0.0.1:9102\"}'"
+            "e.g. '{\"judge\":\"http://127.0.0.1:9100\",\"judge_b\":\"http://127.0.0.1:9101\",\"worker\":\"http://127.0.0.1:9102\"}'"
         ),
     )
     parser.add_argument(
@@ -123,9 +123,8 @@ def build_run_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="split_worker_remote_endpoints",
         help=(
-            "Route worker_a remote checks to --remote-host and worker_b checks to "
-            "--remote-host-secondary for remote_primary stages. "
-            "Use this to avoid compile contention when both workers run heavy gates."
+            "Legacy flag (no-op in single-worker mode). "
+            "Previously routed dual-worker checks to separate remote hosts."
         ),
     )
     parser.add_argument(
@@ -161,11 +160,11 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--owner-worker",
         type=str,
-        default="worker_a",
-        choices=["worker_a", "worker_b"],
+        default="worker",
+        choices=["worker"],
         help=(
             "Which worker workspace is promoted back to target repo when a stage passes. "
-            "Default: worker_a"
+            "Default: worker"
         ),
     )
     parser.add_argument(

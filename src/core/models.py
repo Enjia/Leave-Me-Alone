@@ -54,10 +54,9 @@ PlanNodeKind = Literal[
     "implementation",
     "auto_checks",
     "self_review",
-    "peer_review",
-    "owner_triage",
     "verifier",
     "judge_gate",
+    "gate_merge",
     "promotion",
 ]
 ExecutionEnv = Literal[
@@ -205,7 +204,7 @@ class FailureClassification(StrictBaseModel):
     category: FailureCategory = "unknown"
     disposition: FailureDisposition = "repair_required"
     summary: str
-    owner: Literal["system", "judge", "worker_a", "worker_b", "shared"] = "system"
+    owner: Literal["system", "judge", "judge_b", "worker", "shared"] = "system"
     retryable: bool = False
     evidence: list[str] = Field(default_factory=list)
 
@@ -286,7 +285,7 @@ class WorkerEntryPacket(StrictBaseModel):
 class BaselineStatusArtifact(StrictBaseModel):
     stage_name: str
     round_index: int = 0
-    worker: Literal["worker_a", "worker_b", "shared"] = "shared"
+    worker: Literal["worker", "shared"] = "shared"
     passed: bool = False
     checks: list[str] = Field(default_factory=list)
     failures: list[str] = Field(default_factory=list)
@@ -317,7 +316,7 @@ class InitializerReportArtifact(StrictBaseModel):
 class CleanStateArtifact(StrictBaseModel):
     stage_name: str
     round_index: int
-    worker: Literal["worker_a", "worker_b", "shared"] = "shared"
+    worker: Literal["worker", "shared"] = "shared"
     passed: bool = False
     unresolved_changes: list[str] = Field(default_factory=list)
     undocumented_blockers: list[str] = Field(default_factory=list)
@@ -373,7 +372,7 @@ class ConvergenceSignal(StrictBaseModel):
 class RuntimeNudgeArtifact(StrictBaseModel):
     stage_name: str
     round_index: int
-    target: Literal["worker_a", "worker_b", "judge", "shared"] = "shared"
+    target: Literal["worker", "judge", "judge_b", "shared"] = "shared"
     category: Literal[
         "no_progress",
         "plan_drift",
@@ -440,7 +439,7 @@ class TriageAuditArtifact(StrictBaseModel):
 class PromotionReadinessArtifact(StrictBaseModel):
     stage_name: str
     round_index: int
-    owner_worker: Literal["worker_a", "worker_b"]
+    owner_worker: Literal["worker"]
     all_checks_passed: bool = False
     final_gate_passed: bool = False
     unresolved_blockers: list[str] = Field(default_factory=list)
@@ -457,6 +456,9 @@ class RuntimeStatusSnapshot(StrictBaseModel):
     phase: str = ""
     overall_state: Literal["running", "blocked", "failed", "passed"] = "running"
     worker_states: dict[str, str] = Field(default_factory=dict)
+    # In dual-judge mode, this field holds the merged judge state (e.g.
+    # "dual_reviewing", "approved", "skipped_due_to_spec_gap").  Individual
+    # judge states are tracked in the round log's judge_a_review / judge_b_review.
     judge_state: str = ""
     latest_artifacts: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
@@ -498,7 +500,8 @@ class HarnessStopPolicy(StrictBaseModel):
 
 class HarnessSpecSnapshot(StrictBaseModel):
     provider: str
-    owner_worker: Literal["worker_a", "worker_b"]
+    # Single-worker architecture: only one worker exists, so this is always "worker".
+    owner_worker: Literal["worker"]
     topology: str
     roles: list[HarnessRoleSpec] = Field(default_factory=list)
     validation_gates: list[str] = Field(default_factory=list)
@@ -529,6 +532,8 @@ class StageDashboardArtifact(StrictBaseModel):
     current_round: int = 0
     max_rounds: int = 0
     worker_states: dict[str, str] = Field(default_factory=dict)
+    # In dual-judge mode, holds the merged judge state (e.g. "dual_reviewing",
+    # "approved").  Individual judge states are in round log judge_a/b_review.
     judge_state: str = ""
     latest_plan_overview: dict[str, str] = Field(default_factory=dict)
     latest_check_overview: dict[str, str] = Field(default_factory=dict)
@@ -698,8 +703,7 @@ class PlanGateReview(StrictBaseModel):
     stage_name: str
     round_index: int
     pass_gate: bool
-    worker_a_required_actions: list[str] = Field(default_factory=list)
-    worker_b_required_actions: list[str] = Field(default_factory=list)
+    worker_required_actions: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
     rationale: str
 
@@ -883,7 +887,7 @@ class StageContextPacket(StrictBaseModel):
 class PlanNode(StrictBaseModel):
     node_id: str
     kind: PlanNodeKind
-    owner: Literal["judge", "worker_a", "worker_b", "system"]
+    owner: Literal["judge", "judge_b", "worker", "system"]
     depends_on: list[str] = Field(default_factory=list)
     wait_for: list[str] = Field(default_factory=list)
     write_scope: list[str] = Field(default_factory=list)
@@ -927,16 +931,11 @@ class StageDagPlan(StrictBaseModel):
 
 class StageRoundLog(StrictBaseModel):
     round_index: int
-    worker_a_delivery: WorkerDelivery
-    worker_b_delivery: WorkerDelivery
-    worker_a_auto_checks: AutoCheckResult | None = None
-    worker_b_auto_checks: AutoCheckResult | None = None
-    worker_a_self_review: SelfReviewResult
-    worker_b_self_review: SelfReviewResult
-    peer_review_a_on_b: PeerReviewResult
-    peer_review_b_on_a: PeerReviewResult
-    triage_a: OwnerTriageResult
-    triage_b: OwnerTriageResult
+    worker_delivery: WorkerDelivery
+    worker_auto_checks: AutoCheckResult | None = None
+    worker_self_review: SelfReviewResult
+    judge_a_review: JudgeGateReview | None = None
+    judge_b_review: JudgeGateReview | None = None
     verifier_report: VerifierReport
     judge_gate: JudgeGateReview
 
@@ -948,8 +947,7 @@ class CompactStageRoundLog(StrictBaseModel):
     version retains only the fields needed for cross-stage reasoning.
     """
     round_index: int
-    worker_a_summary: str = ""
-    worker_b_summary: str = ""
+    worker_summary: str = ""
     gate_decision: str = ""
     gate_reasoning: str = ""
     open_report_ids: list[str] = Field(default_factory=list)

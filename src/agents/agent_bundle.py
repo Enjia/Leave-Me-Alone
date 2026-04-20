@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AgentBundle:
     judge: AgentPort
+    judge_b: AgentPort
     verifier: AgentPort
-    worker_a: AgentPort
-    worker_b: AgentPort
-    worker_a_workspace: Path
-    worker_b_workspace: Path
+    worker: AgentPort
+    worker_workspace: Path
+    judge_b_workspace: Path
     a2a_adapters: list[OpenCodeA2AAdapter] | None = None
 
     def start_a2a(self) -> None:
