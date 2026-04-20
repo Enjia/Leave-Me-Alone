@@ -686,13 +686,13 @@ def _render_stage_card(
 _PHASE_META: dict[str, tuple[str, str, int]] = {
     "not_started": ("尚未启动", "等待开始执行", 0),
     "stage_start": ("阶段初始化", "准备执行计划、约束和上下文", 10),
-    "remote_preflight": ("远端预检查", "确认双 worker 远端环境就绪", 20),
+    "remote_preflight": ("远端预检查", "确认 worker 远端环境就绪", 20),
     "remote_preflight_failed": ("远端预检查失败", "先修复环境阻断后再继续", 20),
-    "round_start": ("本轮规划", "两个 worker 并发产出实现方案", 40),
+    "round_start": ("本轮规划", "Worker 产出实现方案，双 Judge 审批", 40),
     "repair_round": ("修复回合", "根据上一轮失败证据收敛修复并补齐验证", 64),
     "plan_gate_review": ("计划闸门", "Judge 审核计划是否可执行", 50),
-    "implementation": ("编码实现", "两个 worker 并发实现已批准方案", 62),
-    "post_impl_checks": ("实现后检查", "自动检查 + 自检 + 互评", 72),
+    "implementation": ("编码实现", "Worker 实现已批准方案", 62),
+    "post_impl_checks": ("实现后检查", "自动检查 + 自检 + 双 Judge 独立审查", 72),
     "verifier_review": ("Verifier 复核", "验证证据与收敛质量", 88),
     "stage_passed": ("阶段完成", "当前 stage 已通过并可推进", 100),
     "stage_failed": ("阶段失败", "当前 stage 失败收敛", 100),
@@ -975,9 +975,9 @@ def _summarize_action(text: str) -> str:
     if lowered.startswith("fix all compile/runtime blockers"):
         return "先修复编译/运行阻断，恢复核心远端命令通过"
     if lowered.startswith("for worker, refactor core module cleanup/control flow"):
-        return "Worker B 需要修复核心模块的清理/控制流问题"
+        return "Worker 需要修复核心模块的清理/控制流问题"
     if lowered.startswith("for worker, resolve exported symbol/api regression"):
-        return "Worker A 需要修复导出符号/API 回归"
+        return "Worker 需要修复导出符号/API 回归"
     if "type-visibility regression in include headers" in lowered:
         return "需要确认 include 头文件的类型可见性回归已修复"
     if lowered.startswith("produce and validate `docs/p2_window_report.json`"):
@@ -986,7 +986,7 @@ def _summarize_action(text: str) -> str:
         return "重新执行完整 post-triage 验证并附带干净证据"
     if "automated checks still failing" in lowered:
         if lowered.startswith("worker:"):
-            return "Worker A 自动检查仍失败，需要继续修复"
+            return "Worker 自动检查仍失败，需要继续修复"
         pass  # legacy worker_b compat removed
         return "自动检查仍失败，需要先修复后再推进"
     if "exhausted automatic recovery budget" in lowered:
