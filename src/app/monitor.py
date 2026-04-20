@@ -547,11 +547,11 @@ def _render_governance_section(
     return f"""
     <div class="grid governance-grid">
       <div>
-        <h3>Triage</h3>
+        <h3>Judge Gate</h3>
         <ul>
           <li>passed={html.escape(str(triage.get("passed", "n/a")))}</li>
-          <li>invalid_rejections={html.escape(str(len(triage.get("invalid_rejections", []) or [])))}</li>
-          <li>fact_high_rejects={html.escape(str(len(triage.get("fact_high_severity_rejections", []) or [])))}</li>
+          <li>disputed_items={html.escape(str(len(triage.get("invalid_rejections", []) or [])))}</li>
+          <li>high_severity_open={html.escape(str(len(triage.get("fact_high_severity_rejections", []) or [])))}</li>
         </ul>
         <ul>{_render_simple_list(triage.get("policy_blockers", []) or [])}</ul>
       </div>
@@ -707,7 +707,7 @@ _WORKER_PROGRESS: dict[str, int] = {
     "replan_required": 28,
     "implementing": 55,
     "self_review": 72,
-    "triaged": 88,
+    "judged": 88,
     "passed": 100,
     "done": 100,
 }
@@ -718,7 +718,7 @@ _WORKER_LABEL: dict[str, str] = {
     "replan_required": "方案被驳回，需要重新规划",
     "implementing": "正在编写代码",
     "self_review": "自检代码质量",
-    "triaged": "问题已分类，等待裁决",
+    "judged": "双 Judge 审查完成，等待合并裁决",
     "passed": "已通过审核",
     "done": "任务完成",
 }
@@ -822,7 +822,7 @@ def _infer_phase_from_states(
         inferred = "implementation"
     elif "replan_required" in states or judge_state == "plan_rejected":
         inferred = "plan_gate_review"
-    elif "self_review" in states or "triaged" in states or judge_state == "waiting_for_reviews":
+    elif "self_review" in states or "judged" in states or judge_state == "waiting_for_reviews":
         inferred = "post_impl_checks"
     elif judge_state == "waiting_for_verifier":
         inferred = "verifier_review"
@@ -983,7 +983,7 @@ def _summarize_action(text: str) -> str:
     if lowered.startswith("produce and validate `docs/p2_window_report.json`"):
         return "补齐并验证 `docs/p2_window_report.json` 证据产物"
     if lowered.startswith("re-run full post-triage harness"):
-        return "重新执行完整 post-triage 验证并附带干净证据"
+        return "重新执行完整验证并附带干净证据"
     if "automated checks still failing" in lowered:
         if lowered.startswith("worker:"):
             return "Worker 自动检查仍失败，需要继续修复"
@@ -2156,7 +2156,7 @@ def render_monitor_html(
       if (lowered.startsWith("for worker, resolve exported symbol/api regression")) return "Worker 需要修复导出符号/API 回归";
       if (lowered.includes("type-visibility regression in include headers")) return "需要确认 include 头文件的类型可见性回归已修复";
       if (lowered.startsWith("produce and validate `docs/p2_window_report.json`")) return "补齐并验证 `docs/p2_window_report.json` 证据产物";
-      if (lowered.startsWith("re-run full post-triage harness")) return "重新执行完整 post-triage 验证并附带干净证据";
+      if (lowered.startsWith("re-run full post-triage harness")) return "重新执行完整验证并附带干净证据";
       if (lowered.includes("automated checks still failing")) {{
         if (lowered.startsWith("worker:")) return "Worker 自动检查仍失败，需要继续修复";
 
